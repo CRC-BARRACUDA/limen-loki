@@ -1,0 +1,29 @@
+# Standalone package (it lives inside the Limen repo tree but is its own module).
+[workspace]
+
+[package]
+name = "loki"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Scans for indicators of compromise with Loki-RS (YARA + IOC) from inside Limen, and reads the reports it produces."
+repository = "https://github.com/CRC-BARRACUDA/limen-loki"
+
+# The cdylib symbol/file uses an underscore (a hyphen isn't a valid Rust lib
+# name), so the loadable is libloki.<ext> and `entry` matches it.
+[lib]
+name = "loki"
+path = "lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+limen-sdk-rust = { git = "https://github.com/CRC-BARRACUDA/Limen.git" }
+# For `NoConsole`. A native module is loaded *in-process* by a GUI built
+# `windows_subsystem = "windows"`, so every child process it spawns must be
+# created without a console or Windows flashes one on screen.
+limen-proto = { git = "https://github.com/CRC-BARRACUDA/Limen.git" }
+serde_json = "1"
+# Verifying the scanner download against its published .sha256. Doing this with
+# the platform's own tool would mean three code paths and parsing three output
+# formats, for something that is twenty lines here.
+sha2 = "0.10"

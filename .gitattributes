@@ -1,0 +1,12 @@
+# Developed on both Windows and Linux with core.autocrlf=true, which rewrites
+# checked-out text files with CRLF. That breaks anything the OS has to execute:
+# a shell script checked out with CRLF fails on Linux with
+# `env: 'bash\r': No such file or directory`, because the CR becomes part of the
+# interpreter name in the shebang. Pin line endings per file type instead of
+# leaving it to the platform.
+
+* text=auto
+
+# Executed by the OS — must keep the endings its interpreter expects.
+*.sh   text eol=lf
+*.ps1  text eol=crlf

@@ -1,0 +1,36 @@
+[module]
+name = "loki"
+display_name = "Loki Scanner"
+description = "Scans files and process memory for indicators of compromise with Loki-RS (YARA + IOC), and reads the reports it produces. Installs the scanner itself on first use."
+version = "0.1.0"
+language = "native"
+entry = "loki"
+abi = "native"
+authors = ["Limen"]
+repo = "CRC-BARRACUDA/limen-loki"
+tags = ["limen", "barracuda", "security", "ioc", "yara", "scanner", "forensics", "local"]
+
+[provides]
+capabilities = ["scan.ioc"]
+
+[permissions]
+# The scanner is not vendored: it is downloaded from its own GitHub release on
+# first use, into `tools/` inside this module — so removing the module removes
+# the tool, and updating the module re-fetches the version that module expects.
+# Releases redirect to objects.githubusercontent.com for the payload itself.
+network = ["github.com", "objects.githubusercontent.com"]
+
+# Shells out for the install (curl, tar) and to run the scanner.
+subprocess = true
+
+# A process scan needs root to read process memory. The module does not become
+# root: it asks the host to run the scanner elevated, and the operating system
+# asks the user. Without this the host refuses.
+elevate = true
+
+# Reads the target the *user* chose, and the report the scanner writes.
+filesystem = ["<user-selected>"]
+
+# Scanning process memory needs administrator/root; reading an existing report
+# does not, so only the scan is gated rather than the whole module.
+elevated_methods = ["scan"]
