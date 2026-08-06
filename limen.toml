@@ -13,6 +13,12 @@ tags = ["limen", "barracuda", "security", "ioc", "yara", "scanner", "forensics",
 [provides]
 capabilities = ["scan.ioc"]
 
+# Optional: when the autoruns module is installed, loki can ask it what starts
+# on this machine and check each entry. Never a hard dependency — the scan is
+# simply not offered when nothing provides it.
+[optional.capabilities]
+"autoruns.local" = ">=0.1"
+
 [permissions]
 # The scanner is not vendored: it is downloaded from its own GitHub release on
 # first use, into `tools/` inside this module — so removing the module removes
