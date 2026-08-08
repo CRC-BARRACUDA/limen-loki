@@ -222,7 +222,6 @@ fn pretty_time(ts: &str) -> String {
 /// A parsed report: the findings, plus whatever the scan boundaries told us.
 #[derive(Default)]
 struct Report {
-    path: String,
     findings: Vec<Event>,
     /// Level -> how many findings carried it, for the filter chips.
     counts: BTreeMap<String, usize>,
@@ -231,6 +230,15 @@ struct Report {
     ended: String,
     summary: String,
     stats: Option<Stats>,
+    /// The scan ran unprivileged, so anything it could not read was skipped
+    /// without being counted.
+    unelevated: bool,
+    /// Stopping did not stop it: the scan is elevated and still running.
+    still_running: bool,
+    /// The last thing the scanner said, kept only when it did not finish — then
+    /// it is the whole diagnosis, and telling the user to go and find it
+    /// elsewhere is no help at all.
+    tail: Vec<String>,
     /// An autostart scan: how many entries were checked, and how many named a
     /// program that could not be read. The second number matters — autoruns
     /// skips keys it cannot see without admin, and a command whose program is
@@ -621,7 +629,11 @@ fn bundled_rules(host: &Host) -> Option<(usize, String)> {
 fn update_bundled_rules(host: &Host) -> Result<(), String> {
     use limen_proto::NoConsole;
     let root = install_root(host).ok_or_else(|| "no module directory".to_string())?;
-    let util = root.join(if cfg!(windows) { "loki-util.exe" } else { "loki-util" });
+    let util = root.join(if cfg!(windows) {
+        "loki-util.exe"
+    } else {
+        "loki-util"
+    });
     if !util.exists() {
         return Err("loki-util is not installed".into());
     }
@@ -826,8 +838,10 @@ fn scan_args(cfg: &Value, target: Option<&str>, out: &Path) -> Vec<String> {
         _ => None,
     };
     if let Some(t) = threads {
-        a.push("--threads".into());
-        a.push(t.into());
+        // `--threads=-2`, not `--threads -2`: a negative value as its own
+        // argument is read as a flag, and the scanner exits on a usage error
+        // having scanned nothing. The equals form leaves no doubt.
+        a.push(format!("--threads={t}"));
     }
     for (key, flagname) in [
         ("cpu", "--cpu-limit"),
@@ -841,8 +855,10 @@ fn scan_args(cfg: &Value, target: Option<&str>, out: &Path) -> Vec<String> {
         // otherwise make the scanner refuse to start, with the reason buried in
         // output nobody sees.
         if !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()) {
-            a.push(flagname.into());
-            a.push(v);
+            // These are unsigned, so the separate form is safe — but written the
+            // same way as `--threads` so nothing here can drift into the bug
+            // that one had.
+            a.push(format!("{flagname}={v}"));
         }
     }
     a
@@ -929,9 +945,7 @@ fn autorun_entries(host: &Host, enabled_only: bool) -> Result<(Vec<Value>, u64),
         .cloned()
         .unwrap_or_default()
         .into_iter()
-        .filter(|e| {
-            !enabled_only || e.get("enabled").and_then(Value::as_bool).unwrap_or(true)
-        })
+        .filter(|e| !enabled_only || e.get("enabled").and_then(Value::as_bool).unwrap_or(true))
         .collect();
     Ok((entries, total))
 }
@@ -1073,6 +1087,34 @@ fn scan_progress(outs: &[PathBuf]) -> (usize, usize) {
         }
     }
     (lines, hits)
+}
+
+/// What the scanner has said so far, most recent last.
+///
+/// Loki writes no per-file activity — that lives only in its TUI, which is off
+/// because it would fight a child process. What it does write is worth showing:
+/// which paths it excluded, how many threads it took, whether it is running
+/// elevated, and each finding as it lands.
+fn scan_output(outs: &[PathBuf], keep: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in outs {
+        let Ok(text) = std::fs::read_to_string(p) else {
+            continue;
+        };
+        for l in text.lines() {
+            if let Some(m) = serde_json::from_str::<Value>(l)
+                .ok()
+                .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string))
+                .filter(|m| !m.is_empty())
+            {
+                out.push(m);
+            }
+        }
+    }
+    if out.len() > keep {
+        out.drain(..out.len() - keep);
+    }
+    out
 }
 
 /// A scan, running on its own thread.
@@ -1365,22 +1407,35 @@ fn settings_modal(lang: &str, cfg: &Value, mode: Mode) -> Value {
     // be controls that do nothing — worse than not offering them.
     if mode == Mode::Files {
         w.push(label(t("scan.section_scanning")).weak());
-        w.push(boxed(checkbox("all_files", t("scan.all_files")), on("all_files")));
-        w.push(boxed(checkbox("archives", t("scan.archives")), on("archives")));
+        w.push(boxed(
+            checkbox("all_files", t("scan.all_files")),
+            on("all_files"),
+        ));
+        w.push(boxed(
+            checkbox("archives", t("scan.archives")),
+            on("archives"),
+        ));
         w.push(separator());
     }
     w.extend(vec![
         row(vec![
-            select("threads", choices("threads", &["all-2", "all-1", "all", "1"]))
-                .label(t("scan.threads")),
+            select(
+                "threads",
+                choices("threads", &["all-2", "all-1", "all", "1"]),
+            )
+            .label(t("scan.threads")),
             select("cpu", choices("cpu", &["100", "80", "60", "40"])).label(t("scan.cpu")),
         ]),
         separator(),
         label(t("scan.section_thresholds")).weak(),
         row(vec![
             text("alert").label(t("scan.alert")).default(txt("alert")),
-            text("warning").label(t("scan.warning")).default(txt("warning")),
-            text("notice").label(t("scan.notice")).default(txt("notice")),
+            text("warning")
+                .label(t("scan.warning"))
+                .default(txt("warning")),
+            text("notice")
+                .label(t("scan.notice"))
+                .default(txt("notice")),
         ]),
     ]);
     if mode == Mode::Files {
@@ -1422,17 +1477,15 @@ fn signatures_modal(
     // The bundled set is a signature source like any other, so it belongs in the
     // list — and when it is not there, the way to get it belongs next to the way
     // to add anything else.
-    add_row.push(
-        button(
-            t(if bundled.is_some() {
-                "sig.core_update"
-            } else {
-                "sig.core_install"
-            }),
-            "scan.ioc",
-            "sig_core",
-        ),
-    );
+    add_row.push(button(
+        t(if bundled.is_some() {
+            "sig.core_update"
+        } else {
+            "sig.core_install"
+        }),
+        "scan.ioc",
+        "sig_core",
+    ));
 
     let mut w = vec![
         label(t("sig.what")).weak(),
@@ -1488,7 +1541,9 @@ fn signatures_modal(
         } else {
             (
                 t("sig.confirm_custom"),
-                id.split_once('/').map(|(_, n)| n.to_string()).unwrap_or_default(),
+                id.split_once('/')
+                    .map(|(_, n)| n.to_string())
+                    .unwrap_or_default(),
             )
         };
         menus.push(vec![
@@ -1603,7 +1658,11 @@ fn signature_info(host: &Host, id: &str) -> Option<SigInfo> {
         let mut by_source: BTreeMap<&str, usize> = BTreeMap::new();
         for r in &rules {
             let src = r.split('_').next().unwrap_or(r);
-            if src.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) && src.len() > 2 {
+            if src
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                && src.len() > 2
+            {
                 *by_source.entry(src).or_insert(0) += 1;
             }
         }
@@ -1700,7 +1759,13 @@ fn core_updating_modal(lang: &str) -> Value {
 /// Unpacking comes first and can take a while on a folder full of archives, so
 /// it says which of the two it is doing rather than showing one unchanging
 /// "Scanning…" for the whole run.
-fn scanning_view(lang: &str, lines: usize, hits: usize, stopping: bool) -> Value {
+fn scanning_view(
+    lang: &str,
+    lines: usize,
+    hits: usize,
+    stopping: bool,
+    output: Option<&[String]>,
+) -> Value {
     let t = |k: &str| catalog().tr(lang, k);
     // Stopping is not instant — the worker notices between files — so say so
     // rather than leave "Scanning…" up after the button was pressed.
@@ -1716,7 +1781,7 @@ fn scanning_view(lang: &str, lines: usize, hits: usize, stopping: bool) -> Value
             json!({}),
         );
     }
-    let w = vec![
+    let mut w = vec![
         label(t("scan.running")).strong(),
         step(t("scan.working"), "loading"),
         label(
@@ -1726,8 +1791,28 @@ fn scanning_view(lang: &str, lines: usize, hits: usize, stopping: bool) -> Value
         )
         .weak(),
         separator(),
-        button(t("scan.stop"), "scan.ioc", "stop").danger(),
+        row(vec![
+            button(t("scan.stop"), "scan.ioc", "stop").danger(),
+            button(
+                t(if output.is_some() {
+                    "scan.hide_output"
+                } else {
+                    "scan.show_output"
+                }),
+                "scan.ioc",
+                "toggle_output",
+            ),
+        ]),
     ];
+    if let Some(lines) = output {
+        w.push(separator());
+        if lines.is_empty() {
+            w.push(label(t("scan.no_output_yet")).weak());
+        }
+        for l in lines {
+            w.push(label(l.clone()).mono());
+        }
+    }
     window_auto(t("title"), w, "scan.ioc", "s_poll", json!({}))
 }
 
@@ -1751,31 +1836,60 @@ fn results_view(lang: &str, r: &Report, levels: &[String], page: usize) -> Value
         .iter()
         .filter_map(|l| r.counts.get(*l))
         .sum();
-    // A scan that read nothing is not a clean scan. Saying "nothing suspicious"
-    // over zero examined files is the one answer here that could mislead.
-    let examined = r.stats.as_ref().map_or(1, |s| s.files + s.procs);
-    if examined == 0 && total == 0 {
-        w.push(label(t("results.nothing_scanned")).heading());
-        w.push(label(t("results.nothing_scanned_why")).weak());
-    } else {
-        w.push(
-            label(if serious > 0 {
-                t("results.found").replace("{n}", &serious.to_string())
-            } else if total > 0 {
-                t("results.only_minor").replace("{n}", &total.to_string())
-            } else {
-                t("results.clean")
-            })
-            .heading(),
-        );
+    // Three different answers, and only one of them is "clean".
+    //
+    // Loki writes a summary when it finishes. No summary means it did not: it
+    // was killed, it crashed, or it never got as far as scanning. That is not a
+    // clean machine, and it used to be reported as one — a missing summary was
+    // read as "something was examined" and fell through to the good news.
+    match r.stats.as_ref().map(|s| s.files + s.procs) {
+        None => {
+            w.push(label(t("results.no_summary")).heading());
+            w.push(label(t("results.no_summary_why")).weak());
+            // Whatever it managed to say before it stopped. Usually the reason.
+            if !r.tail.is_empty() {
+                w.push(separator());
+                w.push(label(t("results.last_output")).weak());
+                for l in &r.tail {
+                    w.push(label(l.clone()).mono());
+                }
+            }
+        }
+        // It finished, and looked at nothing.
+        Some(0) if total == 0 => {
+            w.push(label(t("results.nothing_scanned")).heading());
+            w.push(label(t("results.nothing_scanned_why")).weak());
+        }
+        _ => {
+            w.push(
+                label(if serious > 0 {
+                    t("results.found").replace("{n}", &serious.to_string())
+                } else if total > 0 {
+                    t("results.only_minor").replace("{n}", &total.to_string())
+                } else {
+                    t("results.clean")
+                })
+                .heading(),
+            );
+        }
+    }
+
+    // Stopping an elevated scan does not stop it — the kernel will not let an
+    // unprivileged process signal a root one. Saying so beats a screen that
+    // looks like it ended.
+    if r.still_running {
+        w.push(label(t("scan.still_running")).strong());
+    }
+
+    // A scan that could not read everything is not a scan that found nothing.
+    if r.unelevated {
+        w.push(label(t("results.unelevated")).strong());
     }
 
     // An autostart scan counts entries, not files: saying "40 files scanned"
     // for 20 entries would be true and useless.
     if let Some((checked, no_binary)) = r.autoruns {
-        w.push(
-            label(t("results.autoruns_line").replace("{n}", &checked.to_string())).weak(),
-        );
+        w.push(label(t("results.autoruns_line").replace("{n}", &checked.to_string())).weak());
         if no_binary > 0 {
             // Those were checked as text only. Not a failure, but not the same
             // as having been scanned, and the difference is the user's to know.
@@ -1818,8 +1932,14 @@ fn results_view(lang: &str, r: &Report, levels: &[String], page: usize) -> Value
                     .replace("{n}", &n.to_string())
                     .replace("{m}", &m.to_string())
             };
-            rows.push(vec![t("results.files"), of_which(st.files, st.files_matched)]);
-            rows.push(vec![t("results.procs"), of_which(st.procs, st.procs_matched)]);
+            rows.push(vec![
+                t("results.files"),
+                of_which(st.files, st.files_matched),
+            ]);
+            rows.push(vec![
+                t("results.procs"),
+                of_which(st.procs, st.procs_matched),
+            ]);
             if st.secs > 0.0 {
                 rows.push(vec![t("results.duration"), fmt_secs(st.secs)]);
             }
@@ -1829,9 +1949,6 @@ fn results_view(lang: &str, r: &Report, levels: &[String], page: usize) -> Value
                 t("results.skipped_label"),
                 t("results.skipped").replace("{count}", &r.skipped.to_string()),
             ]);
-        }
-        if !r.path.is_empty() {
-            rows.push(vec![t("results.report_file"), r.path.clone()]);
         }
         if !rows.is_empty() {
             w.push(table(vec![String::new(), String::new()], rows));
@@ -1982,7 +2099,10 @@ fn detail_view(lang: &str, e: &Event) -> Value {
     let bytes = |b: u64| t("detail.bytes").replace("{n}", &b.to_string());
     let u64_of = |k: &str| e.raw.get(k).and_then(Value::as_u64);
     let facts: Vec<(String, Option<String>)> = vec![
-        (t("detail.time"), str_of(&e.raw, "timestamp").map(|s| pretty_time(&s))),
+        (
+            t("detail.time"),
+            str_of(&e.raw, "timestamp").map(|s| pretty_time(&s)),
+        ),
         (t("detail.host"), str_of(&e.raw, "hostname")),
         (t("detail.type"), str_of(&e.raw, "file_type")),
         (t("detail.size"), u64_of("file_size").map(bytes)),
@@ -2056,7 +2176,9 @@ fn detail_view(lang: &str, e: &Event) -> Value {
     // The record as it arrived, so nothing is hidden by the fields chosen above.
     w.push(separator());
     w.push(label(t("detail.raw")).weak());
-    w.push(label(serde_json::to_string_pretty(&e.raw).unwrap_or_else(|_| e.raw.to_string())).mono());
+    w.push(
+        label(serde_json::to_string_pretty(&e.raw).unwrap_or_else(|_| e.raw.to_string())).mono(),
+    );
     w.push(separator());
     w.push(button(t("detail.back"), "scan.ioc", "filter"));
     window(t("detail.matched"), w)
@@ -2158,6 +2280,15 @@ struct Loki {
     /// The autostart entries the last autoruns scan was built from, kept so its
     /// findings can name the key rather than the scratch file Loki read.
     staged: Vec<Staged>,
+    /// Whether the scan screen is showing what the scanner has said.
+    show_output: bool,
+    /// Stop was pressed on an elevated scan that could not be stopped.
+    still_running: bool,
+    /// Waiting on the authorization to end a scan, rather than to start one.
+    stopping: bool,
+    /// The last scan ran without privileges because this machine has no way to
+    /// ask for them — the results have to say so.
+    unelevated: bool,
     /// An elevation the host is running for us: the authorization prompt is on
     /// screen, or the elevated scan is under way. Polled rather than waited on,
     /// so the module keeps drawing while the user answers.
@@ -2210,7 +2341,10 @@ impl Handler for Loki {
             // Which scan is showing decides which settings are worth offering.
             "mode" => {
                 self.mode = Mode::from_str(
-                    params.get("mode").and_then(Value::as_str).unwrap_or("files"),
+                    params
+                        .get("mode")
+                        .and_then(Value::as_str)
+                        .unwrap_or("files"),
                 );
                 self.report = None;
                 Ok(self.screen(host, lang, None))
@@ -2236,7 +2370,9 @@ impl Handler for Loki {
                             let keep = match map.get(&k) {
                                 Some(Value::Bool(_)) => Value::Bool(v.as_bool().unwrap_or(false)),
                                 _ => Value::String(
-                                    v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()),
+                                    v.as_str()
+                                        .map(str::to_string)
+                                        .unwrap_or_else(|| v.to_string()),
                                 ),
                             };
                             map.insert(k, keep);
@@ -2254,7 +2390,12 @@ impl Handler for Loki {
                 Ok(self.screen(host, lang, None))
             }
             // The signature pop-up, raised from the settings one.
-            "signatures" => Ok(signatures_modal(lang, &list_custom(host), bundled_rules(host), None)),
+            "signatures" => Ok(signatures_modal(
+                lang,
+                &list_custom(host),
+                bundled_rules(host),
+                None,
+            )),
             "sig_add" => {
                 let src = params
                     .get("sig_file")
@@ -2276,13 +2417,21 @@ impl Handler for Loki {
                 };
                 // Same pop-up id, so this redraws in place rather than opening
                 // another over it.
-                Ok(signatures_modal(lang, &list_custom(host), bundled_rules(host), err.as_deref()))
+                Ok(signatures_modal(
+                    lang,
+                    &list_custom(host),
+                    bundled_rules(host),
+                    err.as_deref(),
+                ))
             }
             // The picker's current value rides along in the form, so the help
             // explains whatever kind is selected.
             "sig_help" => Ok(signature_help_modal(
                 lang,
-                params.get("sig_kind").and_then(Value::as_str).unwrap_or("yara"),
+                params
+                    .get("sig_kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("yara"),
             )),
             // Fetch (or refresh) the bundled YARA-Forge set. The pop-up shows a
             // spinner and invokes the work itself, so the download does not look
@@ -2303,12 +2452,11 @@ impl Handler for Loki {
             // Double-click, or "Open info" from the row menu.
             "sig_info" => {
                 let id = params.get("id").and_then(Value::as_str).unwrap_or_default();
-                let in_tab = params.get("in_tab").and_then(Value::as_bool).unwrap_or(false);
-                Ok(signature_info_modal(
-                    lang,
-                    signature_info(host, id),
-                    in_tab,
-                ))
+                let in_tab = params
+                    .get("in_tab")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                Ok(signature_info_modal(lang, signature_info(host, id), in_tab))
             }
             "sig_core" => Ok(core_updating_modal(lang)),
             "sig_core_run" => {
@@ -2330,7 +2478,9 @@ impl Handler for Loki {
                     Some("bundled") => {
                         if let Some(root) = install_root(host) {
                             let _ = std::fs::remove_file(
-                                root.join("signatures").join("yara").join("yara-rules-core.yar"),
+                                root.join("signatures")
+                                    .join("yara")
+                                    .join("yara-rules-core.yar"),
                             );
                         }
                     }
@@ -2341,7 +2491,12 @@ impl Handler for Loki {
                     }
                     None => {}
                 }
-                Ok(signatures_modal(lang, &list_custom(host), bundled_rules(host), None))
+                Ok(signatures_modal(
+                    lang,
+                    &list_custom(host),
+                    bundled_rules(host),
+                    None,
+                ))
             }
             // Start the scanner and hand the screen to the poller.
             "scan" => {
@@ -2376,31 +2531,6 @@ impl Handler for Loki {
                 let _ = std::fs::create_dir_all(&dir);
                 let cfg = self.cfg(host).clone();
 
-                // A process scan is worthless without privileges — Loki reads
-                // nothing and reports a clean machine. Ask the OS, and let the
-                // host wait for the answer so this module keeps drawing.
-                if self.mode == Mode::Procs && is_elevated() != Some(true) {
-                    let (can, _how) = host.can_elevate();
-                    if !can {
-                        return Ok(self.screen(host, lang, Some(&t("scan.no_elevation"))));
-                    }
-                    let out = dir.join("report.jsonl");
-                    let _ = std::fs::remove_file(&out);
-                    let args = scan_args(&cfg, None, &out);
-                    let mut argv: Vec<&str> = vec![bin.to_str().unwrap_or_default()];
-                    argv.extend(args.iter().map(String::as_str));
-                    let workdir = bin.parent().unwrap_or(&root).to_string_lossy().into_owned();
-                    match host.elevate_async(&argv, Some(&workdir)) {
-                        Some(id) => {
-                            self.elevation = Some((id, out));
-                            return Ok(authorizing_modal(lang));
-                        }
-                        None => {
-                            return Ok(self.screen(host, lang, Some(&t("scan.no_elevation"))))
-                        }
-                    }
-                }
-
                 // An autostart scan asks the autoruns module what starts on this
                 // machine, then lays each entry out as files the scanner can
                 // read — the command as text for the string rules, and the
@@ -2428,6 +2558,42 @@ impl Handler for Loki {
                     (self.mode == Mode::Files).then_some(target)
                 };
 
+                // Every scan asks for privileges, not just the process one: a
+                // scan of anything the user cannot read is skipped in silence —
+                // no count, no warning, and a verdict that looks thorough.
+                //
+                // Required for processes, because Loki reads nothing at all
+                // without them. Preferred for the rest: a machine with no way to
+                // ask still scans what it can, and the results say so.
+                self.unelevated = false;
+                if is_elevated() != Some(true) {
+                    let (can, _how) = host.can_elevate();
+                    if can {
+                        let out = dir.join("report.jsonl");
+                        let _ = std::fs::remove_file(&out);
+                        let args = scan_args(&cfg, folder.as_deref(), &out);
+                        let mut argv: Vec<&str> = vec![bin.to_str().unwrap_or_default()];
+                        argv.extend(args.iter().map(String::as_str));
+                        let workdir = bin.parent().unwrap_or(&root).to_string_lossy().into_owned();
+                        if let Some(id) = host.elevate_async(&argv, Some(&workdir)) {
+                            self.elevation = Some((id, out));
+                            return Ok(authorizing_modal(lang));
+                        }
+                    }
+                    if self.mode == Mode::Procs {
+                        return Ok(self.screen(host, lang, Some(&t("scan.no_elevation"))));
+                    }
+                    // Carry on unprivileged, and remember to say so.
+                    self.unelevated = true;
+                }
+
+                host.log(&format!(
+                    "[loki] scan {} in {}: {}",
+                    self.mode.as_str(),
+                    bin.parent().unwrap_or(&root).display(),
+                    scan_args(&cfg, folder.as_deref(), &dir.join("report.jsonl")).join(" ")
+                ));
+
                 // Running the scanner and waiting on it happen on the worker's
                 // thread, not this one.
                 self.job = Some(Job::spawn(
@@ -2439,25 +2605,54 @@ impl Handler for Loki {
                     folder,
                     cfg.clone(),
                 ));
-                Ok(scanning_view(lang, 0, 0, false))
+                Ok(scanning_view(lang, 0, 0, false, None))
+            }
+            // Show or hide what the scanner has said. The view keeps its own
+            // polling, so the scan carries on either way.
+            "toggle_output" => {
+                self.show_output = !self.show_output;
+                let outs = match &self.job {
+                    Some(job) => job.outs.lock().unwrap().clone(),
+                    None => self
+                        .elevation
+                        .as_ref()
+                        .map(|(_, o)| vec![o.clone()])
+                        .unwrap_or_default(),
+                };
+                let (lines, hits) = scan_progress(&outs);
+                let shown = self.output_lines(&outs);
+                Ok(scanning_view(lang, lines, hits, false, shown.as_deref()))
             }
             // Still going, or finished and ready to read.
             "s_poll" => {
                 // An elevated scan is run by the host, not by our own worker, so
                 // it is polled here rather than through `Job`.
                 if let Some((id, out)) = self.elevation.clone() {
-                    let Some(done) = host.elevate_status(id) else {
-                        // Still going. Once the report has lines the prompt has
-                        // been answered and the scan is under way, so swap the
-                        // authorization pop-up for real progress.
-                        let (lines, hits) = scan_progress(std::slice::from_ref(&out));
-                        return Ok(if lines == 0 {
-                            authorizing_modal(lang)
-                        } else {
-                            scanning_view(lang, lines, hits, false)
-                        });
+                    // The host says which it is. The scanner's own output is a
+                    // poor stand-in: it can lag the prompt by seconds, which
+                    // leaves "waiting for authorization" on screen long after
+                    // the user gave it.
+                    let done = match host.elevate_state(id) {
+                        limen_sdk_rust::ElevateState::Authorizing => {
+                            return Ok(authorizing_modal(lang))
+                        }
+                        limen_sdk_rust::ElevateState::Running if self.stopping => {
+                            return Ok(scanning_view(lang, 0, 0, true, None))
+                        }
+                        limen_sdk_rust::ElevateState::Running => {
+                            let (lines, hits) = scan_progress(std::slice::from_ref(&out));
+                            let out = self.output_lines(std::slice::from_ref(&out));
+                            return Ok(scanning_view(lang, lines, hits, false, out.as_deref()));
+                        }
+                        limen_sdk_rust::ElevateState::Done(d) => d,
                     };
                     self.elevation = None;
+                    // That was the authorization to *stop*: whatever the scan
+                    // wrote is the report, however it ended.
+                    if std::mem::take(&mut self.stopping) {
+                        self.still_running = !done.ran;
+                        return Ok(self.finish_paths(host, lang, &[out]));
+                    }
                     if !done.ran {
                         let key = if done.refused() {
                             "scan.auth_refused"
@@ -2469,7 +2664,7 @@ impl Handler for Loki {
                         let msg = t(key).replace("{error}", &done.message);
                         return Ok(self.screen(host, lang, Some(&msg)));
                     }
-                    return Ok(self.finish_paths(lang, &[out]));
+                    return Ok(self.finish_paths(host, lang, &[out]));
                 }
 
                 // Everything is read off the job first so the borrow ends before
@@ -2493,9 +2688,10 @@ impl Handler for Loki {
                 }
                 if running {
                     let (lines, hits) = scan_progress(&outs);
-                    return Ok(scanning_view(lang, lines, hits, stopping));
+                    let shown = self.output_lines(&outs);
+                    return Ok(scanning_view(lang, lines, hits, stopping, shown.as_deref()));
                 }
-                Ok(self.finish(lang))
+                Ok(self.finish(host, lang))
             }
             // Stop a scan the user no longer wants.
             //
@@ -2504,11 +2700,39 @@ impl Handler for Loki {
             // to die. Whatever was written by then is still a readable report,
             // and the next poll shows it.
             "stop" => {
+                // An elevated scan is not ours to kill: it runs as root, and the
+                // kernel will not let an unprivileged process signal it. Ask
+                // anyway, then show what it wrote — and say so if it is still
+                // going, rather than leaving a screen that implies it stopped.
+                if let Some((id, out)) = self.elevation.clone() {
+                    match host.elevate_stop(id) {
+                        // It went quietly.
+                        Ok(()) => {
+                            self.elevation = None;
+                            return Ok(self.finish_paths(host, lang, &[out]));
+                        }
+                        // The kernel refused, and the OS is now asking for the
+                        // privileges to end it. Show that it is asking — the
+                        // same pop-up as starting a scan does, because it is the
+                        // same prompt.
+                        Err(Some(pending)) => {
+                            self.stopping = true;
+                            self.elevation = Some((pending, out));
+                            return Ok(authorizing_modal(lang));
+                        }
+                        Err(None) => {
+                            self.elevation = None;
+                            self.still_running = true;
+                            host.log("[loki] stop asked for, but the scan is still running");
+                            return Ok(self.finish_paths(host, lang, &[out]));
+                        }
+                    }
+                }
                 match &self.job {
                     Some(job) => job.stop(),
                     None => return Ok(self.screen(host, lang, None)),
                 }
-                Ok(scanning_view(lang, 0, 0, true))
+                Ok(scanning_view(lang, 0, 0, true, None))
             }
             "filter" => {
                 let Some(r) = &self.report else {
@@ -2551,6 +2775,29 @@ impl Handler for Loki {
 }
 
 impl Loki {
+    /// Put the scanner's own words on the console.
+    ///
+    /// A scan that fails does so inside a child process nobody is watching, and
+    /// Loki exits 0 either way — so the report is the only account of it, and
+    /// the console is where it belongs when the scan is over.
+    fn log_outcome(&self, host: &Host, r: &Report, outs: &[PathBuf]) {
+        if r.stats.is_some() {
+            return;
+        }
+        host.log("[loki] the scan wrote no summary — it did not finish:");
+        for l in scan_output(outs, 12) {
+            host.log(&format!("[loki]   {l}"));
+        }
+    }
+
+    /// The scanner's output, when the user has asked to see it.
+    ///
+    /// Capped: this is redrawn on every poll, and a scan that runs for an hour
+    /// would otherwise turn the screen into a wall nobody reads.
+    fn output_lines(&self, outs: &[PathBuf]) -> Option<Vec<String>> {
+        self.show_output.then(|| scan_output(outs, 40))
+    }
+
     /// Settings, loaded from disk the first time they are wanted.
     fn cfg(&mut self, host: &Host) -> &Value {
         self.settings.get_or_insert_with(|| load_settings(host))
@@ -2566,24 +2813,26 @@ impl Loki {
     }
 
     /// Read a report the host ran on our behalf, with no `Job` behind it.
-    fn finish_paths(&mut self, lang: &str, outs: &[PathBuf]) -> Value {
+    fn finish_paths(&mut self, host: &Host, lang: &str, outs: &[PathBuf]) -> Value {
         let text = outs
             .iter()
             .filter_map(|p| std::fs::read_to_string(p).ok())
             .collect::<Vec<_>>()
             .join("\n");
         let mut r = parse(&text);
-        r.path = outs
-            .first()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        r.unelevated = self.unelevated;
+        r.still_running = std::mem::take(&mut self.still_running);
+        if r.stats.is_none() {
+            r.tail = scan_output(outs, 12);
+        }
+        self.log_outcome(host, &r, outs);
         let view = results_view(lang, &r, &wanted_levels(&Value::Null), 0);
         self.report = Some(r);
         view
     }
 
     /// Read the report a finished (or stopped) scan left behind.
-    fn finish(&mut self, lang: &str) -> Value {
+    fn finish(&mut self, host: &Host, lang: &str) -> Value {
         let Some(job) = self.job.take() else {
             return window(catalog().tr(lang, "title"), vec![]);
         };
@@ -2594,10 +2843,11 @@ impl Loki {
             .collect::<Vec<_>>()
             .join("\n");
         let mut r = parse(&text);
-        r.path = outs
-            .first()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        r.unelevated = self.unelevated;
+        if r.stats.is_none() {
+            r.tail = scan_output(&outs, 12);
+        }
+        self.log_outcome(host, &r, &outs);
 
         // A finding from an autostart scan is reported against the entry the
         // user can actually go and change, not the scratch file Loki read.
@@ -2756,8 +3006,14 @@ mod tests {
         assert_eq!(pretty_time("2026-08-03T19:44:38"), "2026-08-03 19:44:38");
         // An offset with no fractional part must go too, and the `-` in a
         // negative offset must not be mistaken for a date separator.
-        assert_eq!(pretty_time("2026-08-03T10:02:00+00:00"), "2026-08-03 10:02:00");
-        assert_eq!(pretty_time("2026-08-03T10:02:00-05:00"), "2026-08-03 10:02:00");
+        assert_eq!(
+            pretty_time("2026-08-03T10:02:00+00:00"),
+            "2026-08-03 10:02:00"
+        );
+        assert_eq!(
+            pretty_time("2026-08-03T10:02:00-05:00"),
+            "2026-08-03 10:02:00"
+        );
         assert_eq!(pretty_time("2026-08-03T10:02:00Z"), "2026-08-03 10:02:00");
         assert_eq!(pretty_time(""), "");
     }
@@ -2794,7 +3050,8 @@ mod tests {
         // ...and turning it off is the deliberate act.
         let mut cfg = default_settings();
         cfg["all_files"] = json!(false);
-        assert!(!scan_args(&cfg, Some("/srv"), Path::new("/o")).contains(&"--scan-all-files".to_string()));
+        assert!(!scan_args(&cfg, Some("/srv"), Path::new("/o"))
+            .contains(&"--scan-all-files".to_string()));
     }
 
     /// The program a command runs has to be picked out of it — autostart
@@ -2866,7 +3123,10 @@ mod tests {
         let mut ev = json!({ "file_path": dir.join("00000.cmd").to_string_lossy() });
         relabel_autorun(&mut ev, &staged);
         let shown = ev["file_path"].as_str().unwrap();
-        assert!(shown.contains("CurrentVersion") && shown.contains("Updater"), "{shown}");
+        assert!(
+            shown.contains("CurrentVersion") && shown.contains("Updater"),
+            "{shown}"
+        );
         assert_eq!(ev["autorun_command"], "powershell -enc AAA");
 
         // Something we did not stage is left alone.
@@ -2874,6 +3134,84 @@ mod tests {
         relabel_autorun(&mut other, &staged);
         assert_eq!(other["file_path"], "/srv/unrelated.exe");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Loki writes no per-file activity, so the panel shows what it *does* say —
+    /// which paths it excluded, whether it is elevated, each finding as it
+    /// lands. Capped, because the view is redrawn on every poll.
+    #[test]
+    fn the_scanner_output_can_be_shown_and_is_bounded() {
+        let dir = std::env::temp_dir().join("loki-test-output");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("report.jsonl");
+        let mut text = String::new();
+        for i in 0..120 {
+            text.push_str(&format!(
+                "{{\"event_type\":\"info\",\"message\":\"line {i}\"}}\n"
+            ));
+        }
+        // A line that is not JSON at all — an interrupted scan leaves one.
+        text.push_str("{ truncated\n");
+        std::fs::write(&out, text).unwrap();
+
+        let shown = scan_output(std::slice::from_ref(&out), 40);
+        assert_eq!(shown.len(), 40, "capped");
+        assert_eq!(shown.last().unwrap(), "line 119", "most recent last");
+        assert_eq!(shown.first().unwrap(), "line 80");
+
+        // Hidden by default: the button offers to show it, and the panel is not
+        // there until asked for.
+        let hidden = scanning_view("en", 3, 0, false, None).to_string();
+        assert!(hidden.contains("Show scanner output"));
+        assert!(!hidden.contains("line 119"));
+
+        // Shown: the lines appear, and the button offers to put them away.
+        let open = scanning_view("en", 3, 0, false, Some(&shown)).to_string();
+        assert!(open.contains("Hide scanner output"));
+        assert!(open.contains("line 119"));
+        // ...and it keeps polling either way, or the scan would appear to stall.
+        assert_eq!(
+            serde_json::from_str::<Value>(&open).unwrap()["auto"]["method"],
+            "s_poll"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stop has to do something. On an elevated scan it cannot actually stop the
+    /// scanner — root — so the one thing it must not do is show a screen that
+    /// looks like it ended.
+    #[test]
+    fn a_scan_that_could_not_be_stopped_says_it_is_still_running() {
+        let mut r = parse(SAMPLE);
+        r.still_running = true;
+        let v = results_view("en", &r, &wanted_levels(&Value::Null), 0).to_string();
+        assert!(v.contains("could not be stopped from here"));
+        assert!(v.contains("still going"));
+        // ...and what is shown is flagged as partial.
+        assert!(v.contains("only what it had written"));
+
+        // A scan that ended normally carries none of that.
+        let done = parse(SAMPLE);
+        let v = results_view("en", &done, &wanted_levels(&Value::Null), 0).to_string();
+        assert!(!v.contains("could not be stopped"));
+    }
+
+    /// A scan that could not read everything is not a scan that found nothing.
+    /// Loki hides access errors, so an unprivileged scan of a system directory
+    /// looks exactly like a thorough one that came back clean.
+    #[test]
+    fn a_scan_without_privileges_says_so() {
+        let mut r = parse(SAMPLE);
+        r.unelevated = true;
+        let v = results_view("en", &r, &wanted_levels(&Value::Null), 0).to_string();
+        assert!(v.contains("without administrator privileges"));
+        assert!(v.contains("not a full picture"));
+
+        // And an elevated scan does not carry the caveat.
+        let ok = parse(SAMPLE);
+        let v = results_view("en", &ok, &wanted_levels(&Value::Null), 0).to_string();
+        assert!(!v.contains("without administrator privileges"));
     }
 
     /// An autostart scan counts entries, not files — and has to say how many it
@@ -2912,7 +3250,10 @@ mod tests {
         assert!(all_drives("/media/usb/stuff"));
         assert!(all_drives("/run/media/me/STICK"));
         assert!(all_drives("/Volumes/Backup"));
-        assert!(all_drives("/media/usb"), "the mount point itself, not just under it");
+        assert!(
+            all_drives("/media/usb"),
+            "the mount point itself, not just under it"
+        );
         assert!(all_drives("/home/me/Library/CloudStorage/Dropbox"));
 
         // An ordinary path does not pay for it...
@@ -2952,7 +3293,10 @@ mod tests {
         let v = settings_modal("en", &cfg, Mode::Files);
         let s = v.to_string();
 
-        assert_eq!(v["modal"], "loki.settings", "it is a pop-up, with an identity");
+        assert_eq!(
+            v["modal"], "loki.settings",
+            "it is a pop-up, with an identity"
+        );
         // A select's first option is the one shown.
         let opts = |id: &str| -> Vec<String> {
             v["widgets"]
@@ -2973,7 +3317,10 @@ mod tests {
         };
         assert_eq!(opts("cpu").first().map(String::as_str), Some("40"));
         assert_eq!(opts("threads").first().map(String::as_str), Some("1"));
-        assert!(s.contains(r#""default":"70""#), "threshold shows the saved value");
+        assert!(
+            s.contains(r#""default":"70""#),
+            "threshold shows the saved value"
+        );
         // A saved checkbox opens ticked, and one that is off opens unticked.
         let boxes: Vec<&Value> = v["widgets"].as_array().unwrap().iter().collect();
         let checked = |id: &str| {
@@ -3004,7 +3351,10 @@ mod tests {
             })
             .find(|w| w.get("text").and_then(Value::as_str) == Some("Cancel"))
             .expect("a Cancel button");
-        assert_eq!(cancel["dismiss"], true, "answered by the host, not a round trip");
+        assert_eq!(
+            cancel["dismiss"], true,
+            "answered by the host, not a round trip"
+        );
 
         let sigs = signatures_modal("en", &[], None, None);
         assert_eq!(sigs["modal"], "loki.signatures");
@@ -3026,7 +3376,10 @@ mod tests {
     #[test]
     fn the_authorization_prompt_is_visible_and_polls_itself() {
         let v = authorizing_modal("en");
-        assert_eq!(v["modal"], "loki.authorizing", "it is a pop-up: nothing else can proceed");
+        assert_eq!(
+            v["modal"], "loki.authorizing",
+            "it is a pop-up: nothing else can proceed"
+        );
         // It has to poll, or it would sit there after the prompt is answered.
         assert_eq!(v["auto"]["method"], "s_poll");
         let s = v.to_string();
@@ -3113,7 +3466,10 @@ mod tests {
         let v = signatures_modal("en", &[], Some((5069, "2026-08-02".into())), None);
         let s = v.to_string();
         assert!(s.contains("yara-rules-core.yar"));
-        assert!(s.contains("5069") && s.contains("2026-08-02"), "its age is the point");
+        assert!(
+            s.contains("5069") && s.contains("2026-08-02"),
+            "its age is the point"
+        );
         assert!(s.contains("Update YARA-Forge Core"));
         assert!(!s.contains("Install YARA-Forge Core"));
     }
@@ -3145,10 +3501,7 @@ mod tests {
 
         for row in table["row_menus"].as_array().unwrap() {
             let items = row.as_array().unwrap();
-            let labels: Vec<&str> = items
-                .iter()
-                .filter_map(|i| i["label"].as_str())
-                .collect();
+            let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
             assert_eq!(
                 labels,
                 vec![
@@ -3166,7 +3519,10 @@ mod tests {
             // ...and only the delete asks.
             assert!(items[0].get("confirm").is_none());
             assert!(items[1].get("confirm").is_none());
-            assert!(items[3]["confirm"]["title"].as_str().unwrap().contains("Remove"));
+            assert!(items[3]["confirm"]["title"]
+                .as_str()
+                .unwrap()
+                .contains("Remove"));
         }
     }
 
@@ -3182,7 +3538,10 @@ mod tests {
         };
         let here = signature_info_modal("en", Some(info()), false);
         assert_eq!(here["modal"], "loki.sig_info");
-        assert_eq!(here["modal_width"], 820.0, "wider than the list, so the window grows");
+        assert_eq!(
+            here["modal_width"], 820.0,
+            "wider than the list, so the window grows"
+        );
         assert!(here.to_string().contains("Back to signatures"));
 
         let tab = signature_info_modal("en", Some(info()), true);
@@ -3210,7 +3569,10 @@ mod tests {
         assert!(empty.to_string().contains("Nothing added yet"));
         let s = one.to_string();
         assert!(s.contains("my-rules.yar"));
-        assert!(s.contains("YARA rules"), "the kind is named, not a bare key");
+        assert!(
+            s.contains("YARA rules"),
+            "the kind is named, not a bare key"
+        );
         // The row id carries the kind too: a name alone would not say which
         // directory to remove it from.
         assert!(s.contains("yara/my-rules.yar"));
@@ -3246,7 +3608,10 @@ mod tests {
         }
         assert_eq!(s["cpu"], "40", "what was saved wins");
         assert_eq!(s["alert"], "80", "what was not saved keeps its default");
-        assert!(s.get("gone_key").is_none(), "a key we no longer know is dropped");
+        assert!(
+            s.get("gone_key").is_none(),
+            "a key we no longer know is dropped"
+        );
     }
 
     #[test]
@@ -3273,10 +3638,10 @@ mod tests {
             out,
         );
         assert!(!full.contains(&"--no-archive".to_string()));
-        assert!(full.windows(2).any(|w| w == ["--threads", "0"]));
-        assert!(full.windows(2).any(|w| w == ["--cpu-limit", "60"]));
-        assert!(full.windows(2).any(|w| w == ["--alert-level", "70"]));
-        assert!(full.windows(2).any(|w| w == ["-m", "1000"]));
+        assert!(full.contains(&"--threads=0".to_string()));
+        assert!(full.contains(&"--cpu-limit=60".to_string()));
+        assert!(full.contains(&"--alert-level=70".to_string()));
+        assert!(full.contains(&"-m=1000".to_string()));
     }
 
     /// A process scan is a different job: this machine, not a path. Without
@@ -3287,13 +3652,16 @@ mod tests {
         let a = scan_args(&default_settings(), None, Path::new("/o"));
         assert!(a.contains(&"--no-fs".to_string()));
         assert!(!a.contains(&"--folder".to_string()), "there is no target");
-        assert!(!a.contains(&"--no-procs".to_string()), "processes are the point");
+        assert!(
+            !a.contains(&"--no-procs".to_string()),
+            "processes are the point"
+        );
         // File-only settings have no business in it.
         for flag in ["--scan-all-files", "--no-archive", "--scan-all-drives"] {
             assert!(!a.contains(&flag.to_string()), "{flag} is meaningless here");
         }
         // Tuning still applies to both.
-        assert!(a.windows(2).any(|w| w == ["--alert-level", "80"]));
+        assert!(a.contains(&"--alert-level=80".to_string()));
     }
 
     /// The two scans share almost nothing, so the screen must not offer the
@@ -3320,7 +3688,10 @@ mod tests {
         let ftab = main_view("en", &cfg, 0, Mode::Files, true, None).to_string();
         let ptab = main_view("en", &cfg, 0, Mode::Procs, true, None).to_string();
         assert!(ftab.contains("Scan target"));
-        assert!(!ptab.contains("Scan target"), "a process scan has no target");
+        assert!(
+            !ptab.contains("Scan target"),
+            "a process scan has no target"
+        );
         assert!(ptab.contains("running processes"));
         // One button cycles the three, so none is a dead end.
         assert!(ftab.contains("Scan running processes instead"));
@@ -3333,6 +3704,31 @@ mod tests {
         let no_ar = main_view("en", &cfg, 0, Mode::Procs, false, None).to_string();
         assert!(no_ar.contains("Scan files or a folder instead"));
         assert!(!no_ar.contains("starts automatically instead"));
+    }
+
+    /// A negative value must never be its own argument: the scanner reads it as
+    /// a flag, prints usage and exits having scanned nothing — which looked
+    /// exactly like a fast, clean scan. The default thread setting is negative,
+    /// so this broke every scan there was.
+    #[test]
+    fn negative_numbers_are_joined_to_their_flag() {
+        for (setting, expect) in [("all-2", "--threads=-2"), ("all-1", "--threads=-1")] {
+            let mut cfg = default_settings();
+            cfg["threads"] = json!(setting);
+            let a = scan_args(&cfg, Some("/x"), Path::new("/o"));
+            assert!(a.contains(&expect.to_string()), "{setting} -> {a:?}");
+            // Never as two arguments, whatever else is in there.
+            assert!(
+                !a.iter().any(|x| x == "--threads"),
+                "the separate form is the bug: {a:?}"
+            );
+            // The real hazard: a bare negative number standing on its own,
+            // which the parser can only read as a flag.
+            assert!(
+                !a.iter().any(|x| x.parse::<i64>().is_ok_and(|n| n < 0)),
+                "a negative value stands alone: {a:?}"
+            );
+        }
     }
 
     /// A number that is not a number must be dropped, not handed to the scanner
@@ -3357,7 +3753,10 @@ mod tests {
         let v = results_view("en", &r, &wanted_levels(&Value::Null), 0).to_string();
         assert!(v.contains("need attention"), "a verdict");
         assert!(v.contains("/tmp/evil.bin"), "the findings");
-        assert!(v.contains("Started") && v.contains("Processes"), "and the scan's own numbers");
+        assert!(
+            v.contains("Started") && v.contains("Processes"),
+            "and the scan's own numbers"
+        );
     }
 
     /// The kind column is a column of the same word unless processes were
@@ -3379,6 +3778,54 @@ mod tests {
         assert!(!results_view("en", &r, &wanted_levels(&Value::Null), 0)
             .to_string()
             .contains("Kind"));
+    }
+
+    /// A scan that never finished has no summary — and a missing summary used to
+    /// read as "something was examined", so a crashed or killed scan reported a
+    /// clean machine. The most dangerous answer this module can give.
+    #[test]
+    fn a_scan_that_did_not_finish_is_not_reported_as_clean() {
+        // Startup lines and nothing else: no scan_end, no findings.
+        let cut_short = r#"{"timestamp":"2026-08-03T10:00:00+00:00","level":"INFO","event_type":"scan_start","hostname":"h","message":"Loki-RS scan started"}"#;
+        let r = parse(cut_short);
+        assert!(r.stats.is_none(), "no summary was written");
+        let v = results_view("en", &r, &wanted_levels(&Value::Null), 0).to_string();
+        assert!(v.contains("did not finish"));
+        assert!(!v.contains("Nothing suspicious found"));
+
+        // An empty report is the same story.
+        let v = results_view("en", &parse(""), &wanted_levels(&Value::Null), 0).to_string();
+        assert!(v.contains("did not finish"));
+        assert!(!v.contains("Nothing suspicious found"));
+
+        // A scan that *did* finish and found nothing is still allowed to say so.
+        let done = r#"{"timestamp":"2026-08-03T10:01:00+00:00","level":"INFO","event_type":"scan_end","hostname":"h","message":"Summary - Files scanned: 1240 Matched: 0 | Processes scanned: 0 Matched: 0. Scan Duration: 4.8s"}"#;
+        let v = results_view("en", &parse(done), &wanted_levels(&Value::Null), 0).to_string();
+        assert!(v.contains("Nothing suspicious found"));
+        assert!(!v.contains("did not finish"));
+    }
+
+    /// Telling someone to go and look at output that is only on the previous
+    /// screen is no help. When a scan does not finish, the last thing the
+    /// scanner said is the diagnosis, so it is shown with the failure.
+    #[test]
+    fn a_failed_scan_shows_what_the_scanner_last_said() {
+        let mut r = parse(r#"{"event_type":"scan_start","message":"Loki-RS scan started"}"#);
+        r.tail = vec![
+            "Initializing YARA rules ...".into(),
+            "Failed to initialize YARA rules: Cannot read YARA rules directory ./signatures/yara"
+                .into(),
+        ];
+        let v = results_view("en", &r, &wanted_levels(&Value::Null), 0).to_string();
+        assert!(v.contains("did not finish"));
+        assert!(v.contains("The last thing the scanner said"));
+        assert!(v.contains("Cannot read YARA rules directory"), "the reason is on screen");
+
+        // A scan that finished carries no tail — there is nothing to explain.
+        let done = parse(r#"{"event_type":"scan_end","message":"Summary - Files scanned: 5 Matched: 0 | Processes scanned: 0 Matched: 0. Scan Duration: 1.0s"}"#);
+        assert!(done.tail.is_empty());
+        let v = results_view("en", &done, &wanted_levels(&Value::Null), 0).to_string();
+        assert!(!v.contains("The last thing the scanner said"));
     }
 
     /// "Nothing suspicious" over zero examined files is the one answer here that
@@ -3439,8 +3886,13 @@ mod tests {
                 installing_view(lang, 1),
                 main_view(lang, &default_settings(), 1, Mode::Files, true, None),
                 settings_modal(lang, &default_settings(), Mode::Files),
-                signatures_modal(lang, &[("yara".into(), "r.yar".into())], Some((5069, "2026-08-02".into())), None),
-                scanning_view(lang, 1, 0, false),
+                signatures_modal(
+                    lang,
+                    &[("yara".into(), "r.yar".into())],
+                    Some((5069, "2026-08-02".into())),
+                    None,
+                ),
+                scanning_view(lang, 1, 0, false, None),
             ] {
                 let s = v.to_string();
                 for k in &keys {
@@ -3476,16 +3928,23 @@ mod tests {
             installing_view("uk", 1),
             main_view("uk", &default_settings(), 1, Mode::Files, true, None),
             settings_modal("uk", &default_settings(), Mode::Files),
-            signatures_modal("uk", &[("hashes".into(), "h.txt".into())], Some((5069, "2026-08-02".into())), None),
+            signatures_modal(
+                "uk",
+                &[("hashes".into(), "h.txt".into())],
+                Some((5069, "2026-08-02".into())),
+                None,
+            ),
             signature_help_modal("uk", "c2"),
             signature_help_modal("uk", "yara"),
-            scanning_view("uk", 0, 0, false),
+            scanning_view("uk", 0, 0, false, None),
         ] {
             let s = v.to_string();
             for word in ENGLISH {
-                assert!(!s.contains(word), "English left in a Ukrainian view: {word:?}");
+                assert!(
+                    !s.contains(word),
+                    "English left in a Ukrainian view: {word:?}"
+                );
             }
         }
     }
 }
-
