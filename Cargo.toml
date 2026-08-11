@@ -13,7 +13,6 @@ repository = "https://github.com/CRC-BARRACUDA/limen-loki"
 # name), so the loadable is libloki.<ext> and `entry` matches it.
 [lib]
 name = "loki"
-path = "lib.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
