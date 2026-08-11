@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use limen_sdk_rust::ui::{
-    button, checkbox, file, label, row, select, separator, step, table, text, window, window_auto,
-    window_modal_sized, Widget,
+    button, checkbox, file, label, notice, row, select, separator, step, table, text, window,
+    window_auto, window_modal_sized, Widget,
 };
 use limen_sdk_rust::{export_module, json, rpc, Catalog, Handler, Host, RpcError, Value};
 
@@ -235,6 +235,10 @@ struct Report {
     unelevated: bool,
     /// Stopping did not stop it: the scan is elevated and still running.
     still_running: bool,
+    /// The user pressed Stop. It did not finish, but that is what was asked for
+    /// — so it is not a failure, and saying so is not the same as saying the
+    /// machine is clean.
+    stopped: bool,
     /// The last thing the scanner said, kept only when it did not finish — then
     /// it is the whole diagnosis, and telling the user to go and find it
     /// elsewhere is no help at all.
@@ -1881,6 +1885,12 @@ fn results_view(lang: &str, r: &Report, levels: &[String], page: usize) -> Value
         w.push(label(t("scan.still_running")).strong());
     }
 
+    // Ended early because it was asked to. Without this the screen shows a
+    // partial result with nothing to say why it is partial.
+    if r.stopped && !r.still_running {
+        w.push(label(t("results.stopped")).strong());
+    }
+
     // A scan that could not read everything is not a scan that found nothing.
     if r.unelevated {
         w.push(label(t("results.unelevated")).strong());
@@ -2258,6 +2268,23 @@ fn authorizing_modal(lang: &str) -> Value {
     v
 }
 
+/// What to say when an elevated scan never ran at all: the reason on the screen,
+/// and the shorter one for the corner.
+///
+/// Two of them, because they are read in different places. The screen explains
+/// what can be done about it and has the room to; the alert is what reaches a
+/// user who put the password prompt aside and went back to something else, so it
+/// says only that the scan did not start.
+fn auth_keys(done: &limen_sdk_rust::Elevated) -> (&'static str, &'static str) {
+    if done.refused() {
+        ("scan.auth_refused", "notice.auth_refused")
+    } else if done.unavailable() {
+        ("scan.no_elevation", "notice.no_elevation")
+    } else {
+        ("scan.auth_failed", "notice.auth_failed")
+    }
+}
+
 /// Which levels the user asked to see, defaulting to the ones worth opening on.
 fn wanted_levels(params: &Value) -> Vec<String> {
     match params.get("levels").and_then(Value::as_str) {
@@ -2284,11 +2311,19 @@ struct Loki {
     show_output: bool,
     /// Stop was pressed on an elevated scan that could not be stopped.
     still_running: bool,
-    /// Waiting on the authorization to end a scan, rather than to start one.
-    stopping: bool,
+    /// Stop was pressed. Carried to the report so the outcome reads as a scan
+    /// that was ended rather than one that broke.
+    stopped: bool,
     /// The last scan ran without privileges because this machine has no way to
     /// ask for them — the results have to say so.
     unelevated: bool,
+    /// Whether this scan has already said it started.
+    ///
+    /// The corner notice is an *event*, but the running screen redraws several
+    /// times a second and an elevated scan only becomes "running" during a poll
+    /// — so without this the same alert would be raised on every poll for as
+    /// long as the scan lasted.
+    announced: bool,
     /// An elevation the host is running for us: the authorization prompt is on
     /// screen, or the elevated scan is under way. Polled rather than waited on,
     /// so the module keeps drawing while the user answers.
@@ -2566,6 +2601,7 @@ impl Handler for Loki {
                 // without them. Preferred for the rest: a machine with no way to
                 // ask still scans what it can, and the results say so.
                 self.unelevated = false;
+                self.announced = false;
                 if is_elevated() != Some(true) {
                     let (can, _how) = host.can_elevate();
                     if can {
@@ -2581,7 +2617,11 @@ impl Handler for Loki {
                         }
                     }
                     if self.mode == Mode::Procs {
-                        return Ok(self.screen(host, lang, Some(&t("scan.no_elevation"))));
+                        // Nothing to fall back to: process memory is unreadable
+                        // without privileges, so this scan is over before it
+                        // began — and that is an alert, not a quiet screen.
+                        let view = self.screen(host, lang, Some(&t("scan.no_elevation")));
+                        return Ok(notice(view, "error", t("notice.no_elevation")));
                     }
                     // Carry on unprivileged, and remember to say so.
                     self.unelevated = true;
@@ -2605,7 +2645,8 @@ impl Handler for Loki {
                     folder,
                     cfg.clone(),
                 ));
-                Ok(scanning_view(lang, 0, 0, false, None))
+                let view = scanning_view(lang, 0, 0, false, None);
+                Ok(self.started_notice(lang, view))
             }
             // Show or hide what the scanner has said. The view keeps its own
             // polling, so the scan carries on either way.
@@ -2636,33 +2677,23 @@ impl Handler for Loki {
                         limen_sdk_rust::ElevateState::Authorizing => {
                             return Ok(authorizing_modal(lang))
                         }
-                        limen_sdk_rust::ElevateState::Running if self.stopping => {
-                            return Ok(scanning_view(lang, 0, 0, true, None))
-                        }
                         limen_sdk_rust::ElevateState::Running => {
                             let (lines, hits) = scan_progress(std::slice::from_ref(&out));
                             let out = self.output_lines(std::slice::from_ref(&out));
-                            return Ok(scanning_view(lang, lines, hits, false, out.as_deref()));
+                            // The authorization is where an elevated scan really
+                            // begins, and it is answered here rather than at the
+                            // press of Scan — so this is where it is announced.
+                            let view = scanning_view(lang, lines, hits, false, out.as_deref());
+                            return Ok(self.started_notice(lang, view));
                         }
                         limen_sdk_rust::ElevateState::Done(d) => d,
                     };
                     self.elevation = None;
-                    // That was the authorization to *stop*: whatever the scan
-                    // wrote is the report, however it ended.
-                    if std::mem::take(&mut self.stopping) {
-                        self.still_running = !done.ran;
-                        return Ok(self.finish_paths(host, lang, &[out]));
-                    }
                     if !done.ran {
-                        let key = if done.refused() {
-                            "scan.auth_refused"
-                        } else if done.unavailable() {
-                            "scan.no_elevation"
-                        } else {
-                            "scan.auth_failed"
-                        };
-                        let msg = t(key).replace("{error}", &done.message);
-                        return Ok(self.screen(host, lang, Some(&msg)));
+                        let (why, alert) = auth_keys(&done);
+                        let msg = t(why).replace("{error}", &done.message);
+                        let view = self.screen(host, lang, Some(&msg));
+                        return Ok(notice(view, "error", t(alert)));
                     }
                     return Ok(self.finish_paths(host, lang, &[out]));
                 }
@@ -2701,32 +2732,23 @@ impl Handler for Loki {
             // and the next poll shows it.
             "stop" => {
                 // An elevated scan is not ours to kill: it runs as root, and the
-                // kernel will not let an unprivileged process signal it. Ask
-                // anyway, then show what it wrote — and say so if it is still
-                // going, rather than leaving a screen that implies it stopped.
+                // kernel will not let an unprivileged process signal it. The host
+                // has a supervisor that can, and telling it so is the whole of
+                // stopping — it is never a question for the user, who has already
+                // answered it by pressing Stop.
+                //
+                // Whatever the scan wrote by then is a readable report, so show
+                // that; and if there was nothing to ask, say it is still going
+                // rather than leave a screen implying it stopped.
+                self.stopped = true;
                 if let Some((id, out)) = self.elevation.clone() {
-                    match host.elevate_stop(id) {
-                        // It went quietly.
-                        Ok(()) => {
-                            self.elevation = None;
-                            return Ok(self.finish_paths(host, lang, &[out]));
-                        }
-                        // The kernel refused, and the OS is now asking for the
-                        // privileges to end it. Show that it is asking — the
-                        // same pop-up as starting a scan does, because it is the
-                        // same prompt.
-                        Err(Some(pending)) => {
-                            self.stopping = true;
-                            self.elevation = Some((pending, out));
-                            return Ok(authorizing_modal(lang));
-                        }
-                        Err(None) => {
-                            self.elevation = None;
-                            self.still_running = true;
-                            host.log("[loki] stop asked for, but the scan is still running");
-                            return Ok(self.finish_paths(host, lang, &[out]));
-                        }
+                    let asked = host.elevate_stop(id);
+                    self.elevation = None;
+                    if !asked {
+                        self.still_running = true;
+                        host.log("[loki] stop asked for, but the scan is still running");
                     }
+                    return Ok(self.finish_paths(host, lang, &[out]));
                 }
                 match &self.job {
                     Some(job) => job.stop(),
@@ -2812,6 +2834,58 @@ impl Loki {
         main_view(lang, self.cfg(host), custom, mode, has_autoruns, err)
     }
 
+    /// Say a scan has begun — once per scan.
+    ///
+    /// A scan runs for minutes to hours with nothing but a progress line to show
+    /// for it, and an elevated one starts behind a password prompt the user may
+    /// have answered and looked away from. So the start is worth an alert of its
+    /// own, the same way the end is.
+    fn started_notice(&mut self, lang: &str, view: Value) -> Value {
+        if std::mem::replace(&mut self.announced, true) {
+            return view;
+        }
+        notice(view, "ok", catalog().tr(lang, "notice.started"))
+    }
+
+    /// What a finished scan amounts to, in the corner: found something, found
+    /// nothing, or never got far enough to say.
+    fn scan_notice(&self, lang: &str, r: &Report, view: Value) -> Value {
+        let t = |k: &str| catalog().tr(lang, k);
+        // Keyed by Loki's own spelling of the level, which is upper case. Asking
+        // for "alert" found nothing, every time, so every scan came back "ok" —
+        // a green notice on a machine with a YARA match on it.
+        let alerts = r.counts.get("ALERT").copied().unwrap_or(0);
+        let warnings = ["WARNING", "ERROR"]
+            .iter()
+            .filter_map(|l| r.counts.get(*l))
+            .sum::<usize>();
+        // Stopped on purpose and with nothing to report: that is neither a
+        // failure nor a clean bill, and calling it either would be wrong. What
+        // was found before it stopped still counts, so that falls through.
+        if r.stopped && alerts == 0 && warnings == 0 {
+            return notice(view, "info", t("notice.stopped"));
+        }
+        if r.stats.is_none() && !r.stopped {
+            // No summary means it did not finish, which is not a clean result.
+            return notice(view, "error", t("notice.unfinished"));
+        }
+        if alerts > 0 {
+            notice(
+                view,
+                "error",
+                t("notice.alerts").replace("{n}", &alerts.to_string()),
+            )
+        } else if warnings > 0 {
+            notice(
+                view,
+                "warning",
+                t("notice.warnings").replace("{n}", &warnings.to_string()),
+            )
+        } else {
+            notice(view, "ok", t("notice.clean"))
+        }
+    }
+
     /// Read a report the host ran on our behalf, with no `Job` behind it.
     fn finish_paths(&mut self, host: &Host, lang: &str, outs: &[PathBuf]) -> Value {
         let text = outs
@@ -2822,11 +2896,13 @@ impl Loki {
         let mut r = parse(&text);
         r.unelevated = self.unelevated;
         r.still_running = std::mem::take(&mut self.still_running);
+        r.stopped = std::mem::take(&mut self.stopped);
         if r.stats.is_none() {
             r.tail = scan_output(outs, 12);
         }
         self.log_outcome(host, &r, outs);
         let view = results_view(lang, &r, &wanted_levels(&Value::Null), 0);
+        let view = self.scan_notice(lang, &r, view);
         self.report = Some(r);
         view
     }
@@ -2844,6 +2920,7 @@ impl Loki {
             .join("\n");
         let mut r = parse(&text);
         r.unelevated = self.unelevated;
+        r.stopped = std::mem::take(&mut self.stopped);
         if r.stats.is_none() {
             r.tail = scan_output(&outs, 12);
         }
@@ -2867,6 +2944,7 @@ impl Loki {
         }
 
         let view = results_view(lang, &r, &wanted_levels(&Value::Null), 0);
+        let view = self.scan_notice(lang, &r, view);
         self.report = Some(r);
         view
     }
@@ -3195,6 +3273,146 @@ mod tests {
         let done = parse(SAMPLE);
         let v = results_view("en", &done, &wanted_levels(&Value::Null), 0).to_string();
         assert!(!v.contains("could not be stopped"));
+    }
+
+    /// What was found decides what the notice says.
+    ///
+    /// The levels are counted under Loki's own spelling, which is upper case,
+    /// and this asked for "alert". It matched nothing, so every scan fell
+    /// through to "Nothing found" — a green notice on a machine with a YARA
+    /// match sitting in the results behind it.
+    #[test]
+    fn the_notice_reports_what_was_actually_found() {
+        let loki = Loki::default();
+        let view = || window(catalog().tr("en", "title"), vec![]);
+
+        // SAMPLE carries one ALERT and one WARNING.
+        let r = parse(SAMPLE);
+        assert_eq!(r.counts.get("ALERT"), Some(&1), "the sample lost its alert");
+        let v = loki.scan_notice("en", &r, view()).to_string();
+        assert!(v.contains(r#""level":"error""#), "an alert is not a clean scan: {v}");
+        assert!(v.contains("1 alert"), "{v}");
+
+        // The same scan with the alert taken out is a warning, not an error.
+        let warned = parse(&SAMPLE.replace(r#""level":"ALERT""#, r#""level":"NOTICE""#));
+        let v = loki.scan_notice("en", &warned, view()).to_string();
+        assert!(v.contains(r#""level":"warning""#), "{v}");
+
+        // And one that finished with nothing at all is the only "ok".
+        let clean = parse(
+            &SAMPLE
+                .lines()
+                .filter(|l| !l.contains("_match"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let v = loki.scan_notice("en", &clean, view()).to_string();
+        assert!(v.contains(r#""level":"ok""#), "{v}");
+    }
+
+    /// A scan announces itself when it begins — and only then.
+    ///
+    /// A scan is minutes to hours of a progress line, and an elevated one begins
+    /// behind a password prompt; the user has usually looked away by the time it
+    /// is answered. The trap is that the running screen is redrawn on a poll, so
+    /// the obvious place to say it is one that says it several times a second.
+    #[test]
+    fn a_scan_says_it_started_once() {
+        let mut loki = Loki::default();
+        let view = || scanning_view("en", 0, 0, false, None);
+
+        let first = loki.started_notice("en", view()).to_string();
+        assert!(first.contains(r#""level":"ok""#), "a scan starting is good news: {first}");
+        assert!(first.contains("Scan started"), "{first}");
+
+        // Every redraw after it is the same scan, not a new one.
+        for _ in 0..5 {
+            let again = loki.started_notice("en", view()).to_string();
+            assert!(!again.contains("Scan started"), "the alert was raised twice: {again}");
+        }
+
+        // The next scan is a new event, and clears the flag itself.
+        loki.announced = false;
+        let next = loki.started_notice("en", view()).to_string();
+        assert!(next.contains("Scan started"), "{next}");
+    }
+
+    /// A prompt that was refused, dismissed, or never appeared has to be said out
+    /// loud.
+    ///
+    /// The screen behind it explains what to do; the alert exists for the user
+    /// who put the prompt aside and went back to something else, and would
+    /// otherwise come back to a scan screen that simply never started.
+    #[test]
+    fn an_unauthorized_scan_is_an_error_not_a_silence() {
+        let ended = |reason: &str| limen_sdk_rust::Elevated {
+            ran: false,
+            code: None,
+            reason: reason.into(),
+            message: "polkit said no".into(),
+        };
+
+        // Each of the three ways it can fail says something true, and the corner
+        // never carries the long "install pkexec" explanation the screen does.
+        for (reason, screen, alert) in [
+            ("refused", "scan.auth_refused", "notice.auth_refused"),
+            ("unavailable", "scan.no_elevation", "notice.no_elevation"),
+            ("error", "scan.auth_failed", "notice.auth_failed"),
+        ] {
+            assert_eq!(auth_keys(&ended(reason)), (screen, alert), "for {reason}");
+            // The corner is narrow: the alert says the scan did not start, and
+            // leaves the advice about installing pkexec to the screen.
+            let corner = catalog().tr("en", alert);
+            assert!(!corner.contains("pkexec"), "the alert is the whole explanation: {corner}");
+            assert!(!corner.contains("{error}"), "nothing fills that in here: {corner}");
+        }
+    }
+
+    /// Pressing Stop is not a failure.
+    ///
+    /// A stopped scan has no summary, and "no summary" was read as "it broke" —
+    /// so asking it to stop answered with a red error saying the scan did not
+    /// finish. It did not, because that is what was asked for. What it found
+    /// before stopping is still real, though, so findings win over the wording.
+    #[test]
+    fn stopping_a_scan_is_not_an_error() {
+        let loki = Loki::default();
+        let view = || window(catalog().tr("en", "title"), vec![]);
+
+        // Stopped with nothing found: said plainly, not in red, and never as
+        // "nothing found" — it stopped before it could know that.
+        let mut r = parse("");
+        r.stopped = true;
+        let v = loki.scan_notice("en", &r, view()).to_string();
+        assert!(v.contains(r#""level":"info""#), "a deliberate stop is not an error: {v}");
+        assert!(v.contains("Scan stopped"), "{v}");
+        assert!(!v.contains("Nothing found"), "a stopped scan cannot report a clean machine");
+
+        // Stopped after something matched: the finding is what matters.
+        let mut found = parse(SAMPLE);
+        found.stopped = true;
+        let v = loki.scan_notice("en", &found, view()).to_string();
+        assert!(v.contains(r#""level":"error""#), "findings survive the stop: {v}");
+
+        // And a scan that really did break still says so.
+        let broken = parse("");
+        let v = loki.scan_notice("en", &broken, view()).to_string();
+        assert!(v.contains(r#""level":"error""#), "{v}");
+        assert!(v.contains("did not finish"), "{v}");
+    }
+
+    /// The screen says why it is partial, rather than showing half a result with
+    /// nothing to explain it.
+    #[test]
+    fn a_stopped_scan_says_so_on_the_results_screen() {
+        let mut r = parse(SAMPLE);
+        r.stopped = true;
+        let v = results_view("en", &r, &wanted_levels(&Value::Null), 0).to_string();
+        assert!(v.contains("Stopped before it finished"), "{v}");
+
+        let done = parse(SAMPLE);
+        let v = results_view("en", &done, &wanted_levels(&Value::Null), 0).to_string();
+        assert!(!v.contains("Stopped before it finished"));
     }
 
     /// A scan that could not read everything is not a scan that found nothing.
