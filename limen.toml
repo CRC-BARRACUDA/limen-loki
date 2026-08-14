@@ -2,7 +2,7 @@
 name = "loki"
 display_name = "Loki Scanner"
 description = "Scans files and process memory for indicators of compromise with Loki-RS (YARA + IOC), and reads the reports it produces. Installs the scanner itself on first use."
-version = "0.1.0"
+version = "0.1.1"
 language = "native"
 entry = "loki"
 abi = "native"
