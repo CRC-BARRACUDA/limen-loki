@@ -257,6 +257,13 @@ impl Handler for Loki {
                         let msg = t("scan.no_target");
                         return Ok(self.screen(host, lang, Some(&msg)));
                     }
+                    // The one place the scanner will not go however it is asked.
+                    // Said now, because the alternative is a scan that reads
+                    // nothing and reports the folder clean.
+                    if is_cloud(&chosen) {
+                        let msg = t("scan.cloud_target");
+                        return Ok(self.screen(host, lang, Some(&msg)));
+                    }
                     chosen
                 };
                 let Some(bin) = loki_bin(host) else {
@@ -588,6 +595,13 @@ impl Loki {
                 "warning",
                 t("notice.warnings").replace("{n}", &warnings.to_string()),
             )
+        } else if r.stats.as_ref().is_some_and(|s| s.files == 0 && s.procs == 0) {
+            // A scan that read nothing is not a clean scan. The scanner walks
+            // away from whole classes of path in silence, and a folder it
+            // refused ends exactly like an empty one — so the count is the
+            // difference between "nothing wrong here" and "nothing was looked
+            // at", and the green notice was claiming the first for both.
+            notice(view, "warning", t("notice.nothing_read"))
         } else {
             notice(view, "ok", t("notice.clean"))
         }

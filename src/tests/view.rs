@@ -57,29 +57,72 @@ fn an_autostart_scan_says_what_it_could_and_could_not_check() {
     assert!(!v.contains("autostart entries checked"));
 }
 
-/// Loki skips /media and /Volumes by default, so scanning a USB stick would
-/// read nothing and call it clean. The flag follows the target, because
-/// nobody choosing a folder should have to know that exclusion list exists.
+/// A scan goes where it was pointed, and nowhere else.
+///
+/// Loki skips removable media unless told to scan every drive — and
+/// `--scan-all-drives` does not mean "and this folder too": it throws the target
+/// away and walks every mount on the machine. One file chosen on a USB stick
+/// started a seven-drive scan of the whole system.
 #[test]
-fn a_target_on_removable_media_is_scanned_without_being_asked() {
+fn a_target_on_removable_media_is_scanned_and_nothing_else_is() {
     let cfg = default_settings();
     let args = |t: &str| scan_args(&cfg, Some(t), Path::new("/o"));
-    let all_drives = |t: &str| args(t).contains(&"--scan-all-drives".to_string());
+    let folder = |t: &str| {
+        let a = args(t);
+        let i = a.iter().position(|x| x == "--folder").expect("a target");
+        a[i + 1].clone()
+    };
 
-    assert!(all_drives("/media/usb/stuff"));
-    assert!(all_drives("/run/media/me/STICK"));
-    assert!(all_drives("/Volumes/Backup"));
-    assert!(
-        all_drives("/media/usb"),
-        "the mount point itself, not just under it"
-    );
-    assert!(all_drives("/home/me/Library/CloudStorage/Dropbox"));
+    for target in [
+        "/media/usb/stuff",
+        "/run/media/me/STICK",
+        "/run/media/me/STICK/one.exe",
+        "/Volumes/Backup",
+        "/media/usb",
+    ] {
+        assert!(
+            !args(target).contains(&"--scan-all-drives".to_string()),
+            "{target} turned one target into every drive on the machine"
+        );
+        // Named so the scanner will walk it: same place, spelling its exclusion
+        // list does not match.
+        assert_eq!(folder(target), format!("/{target}"), "{target}");
+    }
 
-    // An ordinary path does not pay for it...
-    assert!(!all_drives("/home/me/Downloads"));
-    assert!(!all_drives("/srv"));
+    // An ordinary path is handed over untouched...
+    for target in ["/home/me/Downloads", "/srv"] {
+        assert_eq!(folder(target), target);
+    }
     // ...and a name that merely starts the same way is not a mount.
-    assert!(!all_drives("/media-backup/old"));
+    assert_eq!(folder("/media-backup/old"), "/media-backup/old");
+}
+
+/// The exclusion is a prefix test on the path as it was handed over, so the
+/// doubled slash has to survive all the way to the argument — and come back off
+/// again before anyone reads a finding.
+#[test]
+fn the_spelling_that_gets_it_scanned_never_reaches_the_user() {
+    let ev = Event::parse(
+        r#"{"event_type":"file_match","level":"ALERT","score":90,
+            "file_path":"//run/media/me/STICK/one.exe"}"#,
+    )
+    .expect("a finding");
+    assert_eq!(ev.subject(), "/run/media/me/STICK/one.exe");
+
+    // Anything else is left exactly as the scanner wrote it.
+    let ev = Event::parse(r#"{"event_type":"file_match","file_path":"/srv/one.exe"}"#).unwrap();
+    assert_eq!(ev.subject(), "/srv/one.exe");
+}
+
+/// A cloud-storage folder is the one target no spelling reaches: Loki matches
+/// `CloudStorage` anywhere in the path. Saying so beats a scan that reads
+/// nothing and reports the folder clean.
+#[test]
+fn a_cloud_folder_is_refused_rather_than_scanned_as_nothing() {
+    assert!(is_cloud("/home/me/Library/CloudStorage/Dropbox/x"));
+    assert!(!is_cloud("/home/me/Downloads"));
+    // It is not a skipped *prefix*, so nothing pretends the spelling would help.
+    assert!(!is_skipped("/home/me/Library/CloudStorage/Dropbox"));
 }
 
 /// The tab asks one question. Everything else moved behind Configure, so

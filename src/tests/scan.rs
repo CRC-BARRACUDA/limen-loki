@@ -191,6 +191,22 @@ fn the_notice_reports_what_was_actually_found() {
     );
     let v = loki.scan_notice("en", &clean, view()).to_string();
     assert!(v.contains(r#""level":"ok""#), "{v}");
+
+    // ...but only if it read something. A scan that walked away from every path
+    // it was given finishes exactly like an empty folder does, and calling that
+    // "nothing found" is the module vouching for a machine it never looked at.
+    let nothing = parse(
+        &SAMPLE
+            .replace("Files scanned: 1240", "Files scanned: 0")
+            .replace("Processes scanned: 87", "Processes scanned: 0")
+            .lines()
+            .filter(|l| !l.contains("_match"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let v = loki.scan_notice("en", &nothing, view()).to_string();
+    assert!(v.contains(r#""level":"warning""#), "read nothing, said clean: {v}");
+    assert!(v.contains("Nothing was read"), "{v}");
 }
 
 /// A scan announces itself when it begins — and only then.

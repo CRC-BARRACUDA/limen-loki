@@ -35,7 +35,7 @@ pub(crate) fn scan_args(cfg: &Value, target: Option<&str>, out: &Path) -> Vec<St
         // are switched off here rather than quietly doubling the work.
         Some(t) => {
             a.push("--folder".into());
-            a.push(t.to_string());
+            a.push(walkable(t));
             a.push("--no-procs".into());
 
             // Loki reads only executables and scripts unless told otherwise, so a
@@ -46,14 +46,6 @@ pub(crate) fn scan_args(cfg: &Value, target: Option<&str>, out: &Path) -> Vec<St
             }
             if !flag("archives") {
                 a.push("--no-archive".into());
-            }
-            // Loki excludes /media, /Volumes and cloud-storage mounts by default,
-            // so a folder chosen from one of them would be scanned as zero files
-            // and reported clean. Nobody picking a folder should have to know
-            // that list exists, so the flag follows the target rather than a
-            // control the user has to find.
-            if target_needs_all_drives(t) {
-                a.push("--scan-all-drives".into());
             }
         }
         // Scanning this machine's processes. Without `--no-fs` Loki would walk
@@ -287,18 +279,55 @@ pub(crate) fn relabel_autorun(ev: &mut Value, staged: &[Staged]) {
     ev["autorun_command"] = Value::String(entry.command.clone());
 }
 
-/// Whether the chosen target sits somewhere Loki skips unless told otherwise.
+/// The paths Loki refuses to walk. Its own list, printed at the top of every
+/// run: `/proc, /dev, /sys, /run, /media, /volumes, /Volumes, CloudStorage`.
+const SKIPPED: [&str; 7] = [
+    "/proc", "/dev", "/sys", "/run", "/media", "/volumes", "/Volumes",
+];
+
+/// Whether Loki would refuse to walk this target where it stands.
 ///
-/// Its default exclusions cover removable and mounted media — the exact places
-/// people scan a suspect disk from. Asked of the target rather than offered as a
-/// setting: a scan of a USB stick that quietly reads nothing is worse than one
-/// that takes a moment longer.
-fn target_needs_all_drives(target: &str) -> bool {
-    const MOUNTED: [&str; 5] = ["/media/", "/mnt/", "/Volumes/", "/volumes/", "/run/media/"];
-    // Trailing separator so the prefix matches the mount point itself as well as
-    // anything under it, and `/media-backup` is not mistaken for `/media`.
+/// A prefix test, so the mount point itself counts as well as anything under it,
+/// and `/media-backup` is not mistaken for `/media`.
+pub(crate) fn is_skipped(target: &str) -> bool {
     let t = format!("{}/", target.trim_end_matches('/'));
-    MOUNTED.iter().any(|m| t.starts_with(m)) || t.contains("CloudStorage/")
+    SKIPPED.iter().any(|p| t.starts_with(&format!("{p}/")))
+}
+
+/// The chosen target, spelled so the scanner will actually walk it.
+///
+/// Removable media mounts under [`SKIPPED`] on every desktop Linux there is —
+/// `/run/media/<user>/<label>` — which is the exact place a suspect disk gets
+/// examined from, and a scan of one read nothing and called it clean.
+///
+/// `--scan-all-drives` is what Loki's help offers for that, and it is not what
+/// the name suggests: it does not mean "and this folder too", it **replaces**
+/// the target with every mount on the machine. Choosing one file on a USB stick
+/// started a seven-drive scan of the whole system, which is how this was found.
+///
+/// The exclusion is a prefix test against the path as it was handed over, so the
+/// same place named differently is walked normally. A doubled leading slash is
+/// that name: the kernel collapses it, every file underneath is read, and the
+/// scanner reports the paths back with the same doubling — which [`Event::parse`]
+/// undoes before anything else sees them.
+///
+/// Never on Windows, where a leading `//` names a network share rather than the
+/// same path spelled twice.
+pub(crate) fn walkable(target: &str) -> String {
+    if cfg!(windows) || !is_skipped(target) {
+        return target.to_string();
+    }
+    format!("/{target}")
+}
+
+/// Whether the target is inside a cloud-storage folder.
+///
+/// The one exclusion no spelling gets past: Loki matches `CloudStorage` anywhere
+/// in the path rather than at the front of it. Worth telling the user about
+/// before the scan, because the alternative is a scan that reads nothing and
+/// says everything is fine.
+pub(crate) fn is_cloud(target: &str) -> bool {
+    target.contains("CloudStorage")
 }
 
 /// How far a running scan has got, read from the reports it is writing.

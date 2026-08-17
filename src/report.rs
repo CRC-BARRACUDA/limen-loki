@@ -20,7 +20,18 @@ pub(crate) struct Event {
 
 impl Event {
     pub(crate) fn parse(line: &str) -> Option<Self> {
-        let raw: Value = serde_json::from_str(line).ok()?;
+        let mut raw: Value = serde_json::from_str(line).ok()?;
+        // The scanner reports paths exactly as it walked them, and a target it
+        // would otherwise skip is handed over with a doubled leading slash (see
+        // `walkable`). Undone here, once, so nothing downstream — the table, the
+        // detail view, a path the user copies — has to know that happened.
+        if let Some(rest) = raw
+            .get("file_path")
+            .and_then(Value::as_str)
+            .and_then(|p| p.strip_prefix("//"))
+        {
+            raw["file_path"] = Value::String(format!("/{rest}"));
+        }
         Some(Event {
             level: str_of(&raw, "level").unwrap_or_default(),
             event_type: str_of(&raw, "event_type").unwrap_or_default(),
