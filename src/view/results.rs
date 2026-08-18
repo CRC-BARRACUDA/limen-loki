@@ -232,10 +232,13 @@ pub(crate) fn results_view(lang: &str, r: &Report, levels: &[String], page: usiz
             .enumerate()
             .map(|(i, _)| (page * PAGE + i).to_string())
             .collect();
+        // Opened here, in the report's own tab: a finding is a step further
+        // into the report, and the detail screen's Back button is the way out
+        // of it. Its own tab per finding would be a tab per click.
         w.push(
             table(cols, rows)
                 .row_ids(ids)
-                .on_activate("scan.ioc", "detail"),
+                .on_activate_here("scan.ioc", "detail"),
         );
     }
 
@@ -264,9 +267,7 @@ pub(crate) fn results_view(lang: &str, r: &Report, levels: &[String], page: usiz
         w.push(row(pager));
     }
 
-    w.push(separator());
-    w.push(button(t("results.new_scan"), "scan.ioc", "ui").primary());
-    window(t("title"), w)
+    window(t("results.tab_title"), w)
 }
 
 /// One finding in full: what matched, where, and why.

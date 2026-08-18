@@ -83,6 +83,7 @@ warning = "Warning"
 notice = "Notice"
 max_size = "Max file size (bytes)"
 reinstall = "Reinstall scanner"
+last_report = "Last report"
 
 [results]
 last_output = "The last thing the scanner said:"
@@ -108,7 +109,9 @@ duration = "Duration"
 skipped_label = "Skipped"
 skipped = "{count} unreadable line(s) — an interrupted scan leaves a truncated last line"
 nothing_at_levels = "Nothing at the selected levels."
-new_scan = "New scan"
+# The report has a tab of its own, and this is its name — "Loki" is the
+# module's tab, and two tabs of the same name are one tab too many.
+tab_title = "Scan report"
 page = "page {page} / {pages}"
 prev = "‹ Prev"
 next = "Next ›"

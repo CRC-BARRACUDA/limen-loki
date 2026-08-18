@@ -4,7 +4,8 @@ use crate::*;
 
 #[derive(Default)]
 pub(crate) struct Loki {
-    report: Option<Report>,
+    /// The last scan's report, kept for the tab it is shown in.
+    pub(crate) report: Option<Report>,
     /// Scan settings, loaded from `tools/settings.json` on first use and kept
     /// here so a scan does not have to re-read them off the disk.
     settings: Option<Value>,
@@ -470,6 +471,13 @@ impl Handler for Loki {
                 }
                 Ok(scanning_view(lang, 0, 0, true, None))
             }
+            // The last scan's report, in a tab of its own — opened by the scan
+            // that produced it, and again from the screen when that tab is
+            // gone.
+            "report_tab" => Ok(match &self.report {
+                Some(r) => results_view(lang, r, &wanted_levels(&Value::Null), 0),
+                None => self.screen(host, lang, None),
+            }),
             "filter" => {
                 let Some(r) = &self.report else {
                     return Ok(self.screen(host, lang, None));
@@ -545,7 +553,8 @@ impl Loki {
         let mode = self.mode;
         // Offered only when something in this session actually provides it.
         let has_autoruns = host.has_capability(AUTORUNS_CAP);
-        main_view(lang, self.cfg(host), custom, mode, has_autoruns, err)
+        let has_report = self.report.is_some();
+        main_view(lang, self.cfg(host), custom, mode, has_autoruns, has_report, err)
     }
 
     /// Say a scan has begun — once per scan.
@@ -607,6 +616,20 @@ impl Loki {
         }
     }
 
+    /// The scan is over: keep the report, and hand it to a tab of its own.
+    ///
+    /// The screen that ran the scan goes back to being the screen you scan
+    /// from — a report is something to read alongside the next scan, not
+    /// something to have to leave in order to start one. The handover is an
+    /// `auto` on this answer, so it happens once, when this screen arrives:
+    /// `ui` returns the same screen without it, and coming back to this tab
+    /// later does not open a second copy of the same report.
+    pub(crate) fn present(&mut self, lang: &str, screen: Value, r: Report) -> Value {
+        let screen = self.scan_notice(lang, &r, screen);
+        self.report = Some(r);
+        auto_in_tab(screen, "scan.ioc", "report_tab", json!({}))
+    }
+
     /// Read a report the host ran on our behalf, with no `Job` behind it.
     fn finish_paths(&mut self, host: &Host, lang: &str, outs: &[PathBuf]) -> Value {
         let text = outs
@@ -622,10 +645,8 @@ impl Loki {
             r.tail = scan_output(outs, 12);
         }
         self.log_outcome(host, &r, outs);
-        let view = results_view(lang, &r, &wanted_levels(&Value::Null), 0);
-        let view = self.scan_notice(lang, &r, view);
-        self.report = Some(r);
-        view
+        let screen = self.screen(host, lang, None);
+        self.present(lang, screen, r)
     }
 
     /// Read the report a finished (or stopped) scan left behind.
@@ -664,9 +685,7 @@ impl Loki {
             }
         }
 
-        let view = results_view(lang, &r, &wanted_levels(&Value::Null), 0);
-        let view = self.scan_notice(lang, &r, view);
-        self.report = Some(r);
-        view
+        let screen = self.screen(host, lang, None);
+        self.present(lang, screen, r)
     }
 }

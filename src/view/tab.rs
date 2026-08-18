@@ -15,6 +15,9 @@ pub(crate) fn main_view(
     custom: usize,
     mode: Mode,
     has_autoruns: bool,
+    // `has_report`: whether a scan has already run this session, so its report
+    // can be reopened after the tab it went to was closed.
+    has_report: bool,
     err: Option<&str>,
 ) -> Value {
     let t = |k: &str| catalog().tr(lang, k);
@@ -64,10 +67,17 @@ pub(crate) fn main_view(
     // What the scan will actually do, in one line — the settings are out of
     // sight, and a scan whose behaviour is invisible is one nobody can trust.
     w.push(label(settings_summary(lang, cfg, custom, mode)).weak());
-    w.push(row(vec![
+    let mut actions = vec![
         button(t("scan.run"), "scan.ioc", "scan").primary(),
         button(t("scan.configure"), "scan.ioc", "config"),
-    ]));
+    ];
+    // The report of the last scan lives in a tab of its own. This is the way
+    // back to it — a tab is a thing you can close, and the report should not go
+    // with it.
+    if has_report {
+        actions.push(button(t("scan.last_report"), "scan.ioc", "report_tab").open_in_tab());
+    }
+    w.push(row(actions));
 
     if let Some(e) = err {
         w.push(separator());

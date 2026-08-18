@@ -129,7 +129,7 @@ fn a_cloud_folder_is_refused_rather_than_scanned_as_nothing() {
 /// the settings must not be on the tab and the way to them must be.
 #[test]
 fn the_tab_asks_one_question_and_points_at_the_rest() {
-    let v = main_view("en", &default_settings(), 0, Mode::Files, true, None).to_string();
+    let v = main_view("en", &default_settings(), 0, Mode::Files, true, false, None).to_string();
     assert!(v.contains("Scan target"));
     assert!(v.contains("Configure scan"));
     // Reinstalling sits beside the version it replaces, on the tab — it was
@@ -595,4 +595,75 @@ fn an_empty_report_does_not_panic() {
     let r = parse("");
     assert_eq!(r.findings.len(), 0);
     let _ = results_view("en", &r, &wanted_levels(&Value::Null), 0);
+}
+
+/// A scan's report opens in a tab of its own.
+///
+/// The screen that ran the scan goes back to being the screen you scan from —
+/// a report is something to read alongside the next scan, not something to
+/// have to leave in order to start one.
+#[test]
+fn a_finished_scan_hands_its_report_to_a_tab_of_its_own() {
+    let mut loki = Loki::default();
+    let screen = window(catalog().tr("en", "title"), vec![]);
+    let v = loki.present("en", screen, parse(SAMPLE));
+
+    // The screen it answers with is the one it was given — not the report.
+    assert!(!v.to_string().contains("cols.subject"));
+    let auto = &v["auto"];
+    assert_eq!(auto["method"], "report_tab");
+    assert_eq!(auto["capability"], "scan.ioc");
+    assert_eq!(auto["open_in_tab"], true, "beside the scan, not on top of it");
+    // What was found is still said in the corner, on the screen the user is on.
+    assert_eq!(v["notice"]["level"], "error", "the sample carries an alert");
+    // And the report is kept, for the tab that is about to ask for it.
+    assert!(loki.report.is_some());
+}
+
+/// The report is a tab, so it is named like one — "Loki" is the module's own
+/// tab, and two tabs of the same name are one tab too many. Its findings open
+/// in it rather than each spawning another tab.
+#[test]
+fn the_report_tab_is_named_for_what_it_holds_and_keeps_its_findings_inside() {
+    let r = parse(SAMPLE);
+    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0);
+    assert_eq!(v["title"], "Scan report");
+    assert_ne!(v["title"], catalog().tr("en", "title"));
+
+    let table = v["widgets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        // The summary is a table too; the findings are the one with rows to
+        // click into.
+        .find(|w| w["kind"] == "table" && w.get("row_ids").is_some())
+        .expect("the findings");
+    assert_eq!(table["on_activate"]["action"]["method"], "detail");
+    assert_eq!(
+        table["on_activate"]["open_in_tab"], false,
+        "a finding is a step further into this report, not another tab"
+    );
+    // Starting another scan is the module's own screen's job now.
+    assert!(!v.to_string().contains("New scan"));
+}
+
+/// A tab can be closed, and the report should not go with it.
+#[test]
+fn the_screen_offers_the_last_report_once_there_is_one() {
+    let cfg = default_settings();
+    let before = main_view("en", &cfg, 0, Mode::Files, true, false, None).to_string();
+    assert!(!before.contains("Last report"), "nothing has been scanned yet");
+
+    let after = main_view("en", &cfg, 0, Mode::Files, true, true, None);
+    let s = after.to_string();
+    assert!(s.contains("Last report"));
+    // In its own tab, like the report the scan opened.
+    let button = after["widgets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|w| w["children"].as_array().cloned().unwrap_or_default())
+        .find(|w| w["action"]["method"] == "report_tab")
+        .expect("the way back to it");
+    assert_eq!(button["open_in_tab"], true);
 }

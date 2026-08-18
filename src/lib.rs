@@ -47,8 +47,8 @@ pub(crate) use std::collections::BTreeMap;
 pub(crate) use std::path::{Path, PathBuf};
 
 pub(crate) use limen_sdk_rust::ui::{
-    button, checkbox, file, label, notice, row, select, separator, step, table, text, window,
-    window_auto, window_modal_sized, Widget,
+    auto_in_tab, button, checkbox, file, label, notice, row, select, separator, step, table, text,
+    window, window_auto, window_modal_sized, Widget,
 };
 pub(crate) use limen_sdk_rust::{json, rpc, Catalog, Handler, Host, RpcError, Value};
 

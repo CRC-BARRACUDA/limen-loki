@@ -371,8 +371,8 @@ fn each_scan_offers_only_its_own_settings() {
     }
 
     // And the tab asks for a path only when there is one to ask for.
-    let ftab = main_view("en", &cfg, 0, Mode::Files, true, None).to_string();
-    let ptab = main_view("en", &cfg, 0, Mode::Procs, true, None).to_string();
+    let ftab = main_view("en", &cfg, 0, Mode::Files, true, false, None).to_string();
+    let ptab = main_view("en", &cfg, 0, Mode::Procs, true, false, None).to_string();
     assert!(ftab.contains("Scan target"));
     assert!(
         !ptab.contains("Scan target"),
@@ -382,12 +382,12 @@ fn each_scan_offers_only_its_own_settings() {
     // One button cycles the three, so none is a dead end.
     assert!(ftab.contains("Scan running processes instead"));
     assert!(ptab.contains("Scan what starts automatically instead"));
-    let atab = main_view("en", &cfg, 0, Mode::Autoruns, true, None).to_string();
+    let atab = main_view("en", &cfg, 0, Mode::Autoruns, true, false, None).to_string();
     assert!(atab.contains("Scan files or a folder instead"));
 
     // ...and autostart is skipped entirely when nothing provides it, rather
     // than offering a scan that cannot run.
-    let no_ar = main_view("en", &cfg, 0, Mode::Procs, false, None).to_string();
+    let no_ar = main_view("en", &cfg, 0, Mode::Procs, false, false, None).to_string();
     assert!(no_ar.contains("Scan files or a folder instead"));
     assert!(!no_ar.contains("starts automatically instead"));
 }
