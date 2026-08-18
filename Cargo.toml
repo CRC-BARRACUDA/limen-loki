@@ -3,7 +3,7 @@
 
 [package]
 name = "loki"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Scans for indicators of compromise with Loki-RS (YARA + IOC) from inside Limen, and reads the reports it produces."
