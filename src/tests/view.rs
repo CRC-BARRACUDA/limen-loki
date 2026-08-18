@@ -85,8 +85,17 @@ fn a_target_on_removable_media_is_scanned_and_nothing_else_is() {
             "{target} turned one target into every drive on the machine"
         );
         // Named so the scanner will walk it: same place, spelling its exclusion
-        // list does not match.
-        assert_eq!(folder(target), format!("/{target}"), "{target}");
+        // list does not match. The renaming is Unix's — on Windows a leading
+        // `//` names a network share rather than the same path twice, so there
+        // the target is handed over as it was given. The mount points are Linux
+        // and macOS spellings either way; what is checked on both is that one
+        // target never becomes every drive.
+        let walkable = if cfg!(windows) {
+            target.to_string()
+        } else {
+            format!("/{target}")
+        };
+        assert_eq!(folder(target), walkable, "{target}");
     }
 
     // An ordinary path is handed over untouched...
