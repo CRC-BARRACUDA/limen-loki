@@ -8,11 +8,11 @@ use super::*;
 fn a_stopped_scan_says_so_on_the_results_screen() {
     let mut r = parse(SAMPLE);
     r.stopped = true;
-    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(v.contains("Stopped before it finished"), "{v}");
 
     let done = parse(SAMPLE);
-    let v = results_view("en", &done, &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &done, &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(!v.contains("Stopped before it finished"));
 }
 
@@ -23,13 +23,13 @@ fn a_stopped_scan_says_so_on_the_results_screen() {
 fn a_scan_without_privileges_says_so() {
     let mut r = parse(SAMPLE);
     r.unelevated = true;
-    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(v.contains("without administrator privileges"));
     assert!(v.contains("not a full picture"));
 
     // And an elevated scan does not carry the caveat.
     let ok = parse(SAMPLE);
-    let v = results_view("en", &ok, &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &ok, &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(!v.contains("without administrator privileges"));
 }
 
@@ -40,20 +40,20 @@ fn a_scan_without_privileges_says_so() {
 fn an_autostart_scan_says_what_it_could_and_could_not_check() {
     let mut r = parse(SAMPLE);
     r.autoruns = Some((40, 6));
-    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(v.contains("40 autostart entries checked"));
     assert!(v.contains("6 of them named a program that could not be read"));
 
     // Nothing unreadable: no second line to explain away.
     let mut clean = parse(SAMPLE);
     clean.autoruns = Some((40, 0));
-    let v = results_view("en", &clean, &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &clean, &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(v.contains("40 autostart entries checked"));
     assert!(!v.contains("could not be read"));
 
     // A file scan says nothing about autostart at all.
     let files = parse(SAMPLE);
-    let v = results_view("en", &files, &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &files, &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(!v.contains("autostart entries checked"));
 }
 
@@ -129,7 +129,7 @@ fn a_cloud_folder_is_refused_rather_than_scanned_as_nothing() {
 /// the settings must not be on the tab and the way to them must be.
 #[test]
 fn the_tab_asks_one_question_and_points_at_the_rest() {
-    let v = main_view("en", &default_settings(), 0, Mode::Files, true, false, None).to_string();
+    let v = main_view("en", &default_settings(), 0, Mode::Files, true, None, None).to_string();
     assert!(v.contains("Scan target"));
     assert!(v.contains("Configure scan"));
     // Reinstalling sits beside the version it replaces, on the tab — it was
@@ -481,7 +481,7 @@ fn saved_settings_merge_over_the_defaults() {
 #[test]
 fn results_show_what_the_scan_actually_did() {
     let r = parse(SAMPLE);
-    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(v.contains("need attention"), "a verdict");
     assert!(v.contains("/tmp/evil.bin"), "the findings");
     assert!(
@@ -495,7 +495,7 @@ fn results_show_what_the_scan_actually_did() {
 #[test]
 fn the_kind_column_appears_only_when_it_says_something() {
     let both = parse(SAMPLE);
-    assert!(results_view("en", &both, &wanted_levels(&Value::Null), 0)
+    assert!(results_view("en", &both, &wanted_levels(&Value::Null), 0, 0)
         .to_string()
         .contains("Kind"));
 
@@ -506,7 +506,7 @@ fn the_kind_column_appears_only_when_it_says_something() {
         .collect::<Vec<_>>()
         .join("\n");
     let r = parse(&files_only);
-    assert!(!results_view("en", &r, &wanted_levels(&Value::Null), 0)
+    assert!(!results_view("en", &r, &wanted_levels(&Value::Null), 0, 0)
         .to_string()
         .contains("Kind"));
 }
@@ -520,18 +520,18 @@ fn a_scan_that_did_not_finish_is_not_reported_as_clean() {
     let cut_short = r#"{"timestamp":"2026-08-03T10:00:00+00:00","level":"INFO","event_type":"scan_start","hostname":"h","message":"Loki-RS scan started"}"#;
     let r = parse(cut_short);
     assert!(r.stats.is_none(), "no summary was written");
-    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(v.contains("did not finish"));
     assert!(!v.contains("Nothing suspicious found"));
 
     // An empty report is the same story.
-    let v = results_view("en", &parse(""), &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &parse(""), &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(v.contains("did not finish"));
     assert!(!v.contains("Nothing suspicious found"));
 
     // A scan that *did* finish and found nothing is still allowed to say so.
     let done = r#"{"timestamp":"2026-08-03T10:01:00+00:00","level":"INFO","event_type":"scan_end","hostname":"h","message":"Summary - Files scanned: 1240 Matched: 0 | Processes scanned: 0 Matched: 0. Scan Duration: 4.8s"}"#;
-    let v = results_view("en", &parse(done), &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &parse(done), &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(v.contains("Nothing suspicious found"));
     assert!(!v.contains("did not finish"));
 }
@@ -547,7 +547,7 @@ fn a_failed_scan_shows_what_the_scanner_last_said() {
         "Failed to initialize YARA rules: Cannot read YARA rules directory ./signatures/yara"
             .into(),
     ];
-    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(v.contains("did not finish"));
     assert!(v.contains("The last thing the scanner said"));
     assert!(v.contains("Cannot read YARA rules directory"), "the reason is on screen");
@@ -555,7 +555,7 @@ fn a_failed_scan_shows_what_the_scanner_last_said() {
     // A scan that finished carries no tail — there is nothing to explain.
     let done = parse(r#"{"event_type":"scan_end","message":"Summary - Files scanned: 5 Matched: 0 | Processes scanned: 0 Matched: 0. Scan Duration: 1.0s"}"#);
     assert!(done.tail.is_empty());
-    let v = results_view("en", &done, &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &done, &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(!v.contains("The last thing the scanner said"));
 }
 
@@ -565,7 +565,7 @@ fn a_failed_scan_shows_what_the_scanner_last_said() {
 fn a_scan_that_read_nothing_does_not_claim_to_be_clean() {
     let empty = r#"{"timestamp":"2026-08-03T10:00:00+00:00","level":"INFO","event_type":"scan_end","hostname":"h","message":"Summary - Files scanned: 0 Matched: 0 | Processes scanned: 0 Matched: 0. Scan Duration: 4.8s"}"#;
     let r = parse(empty);
-    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(!v.contains("Nothing suspicious found"));
     assert!(v.contains("No files were examined"));
 }
@@ -573,7 +573,7 @@ fn a_scan_that_read_nothing_does_not_claim_to_be_clean() {
 #[test]
 fn the_detail_view_shows_the_rule_and_what_it_matched() {
     let r = parse(SAMPLE);
-    let v = detail_view("en", &r.findings[0]).to_string();
+    let v = detail_view("en", &r.findings[0], 0).to_string();
     assert!(v.contains("MAL_Backdoor_Gen"));
     assert!(v.contains("Florian Roth"));
     assert!(v.contains("cmd.exe /c"), "matched strings are the evidence");
@@ -583,7 +583,7 @@ fn the_detail_view_shows_the_rule_and_what_it_matched() {
 #[test]
 fn default_levels_hide_the_noise() {
     let r = parse(SAMPLE);
-    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(v.contains("/tmp/evil.bin"));
     assert!(!v.contains("/tmp/x.tmp"), "NOTICE is not shown by default");
     // ...but the chip still advertises it.
@@ -594,7 +594,7 @@ fn default_levels_hide_the_noise() {
 fn an_empty_report_does_not_panic() {
     let r = parse("");
     assert_eq!(r.findings.len(), 0);
-    let _ = results_view("en", &r, &wanted_levels(&Value::Null), 0);
+    let _ = results_view("en", &r, &wanted_levels(&Value::Null), 0, 0);
 }
 
 /// A scan's report opens in a tab of its own.
@@ -617,7 +617,7 @@ fn a_finished_scan_hands_its_report_to_a_tab_of_its_own() {
     // What was found is still said in the corner, on the screen the user is on.
     assert_eq!(v["notice"]["level"], "error", "the sample carries an alert");
     // And the report is kept, for the tab that is about to ask for it.
-    assert!(loki.report.is_some());
+    assert!(loki.newest_report().is_some());
 }
 
 /// The report is a tab, so it is named like one — "Loki" is the module's own
@@ -626,7 +626,7 @@ fn a_finished_scan_hands_its_report_to_a_tab_of_its_own() {
 #[test]
 fn the_report_tab_is_named_for_what_it_holds_and_keeps_its_findings_inside() {
     let r = parse(SAMPLE);
-    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0);
+    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0, 0);
     assert_eq!(v["title"], "Scan report");
     assert_ne!(v["title"], catalog().tr("en", "title"));
 
@@ -651,10 +651,10 @@ fn the_report_tab_is_named_for_what_it_holds_and_keeps_its_findings_inside() {
 #[test]
 fn the_screen_offers_the_last_report_once_there_is_one() {
     let cfg = default_settings();
-    let before = main_view("en", &cfg, 0, Mode::Files, true, false, None).to_string();
+    let before = main_view("en", &cfg, 0, Mode::Files, true, None, None).to_string();
     assert!(!before.contains("Last report"), "nothing has been scanned yet");
 
-    let after = main_view("en", &cfg, 0, Mode::Files, true, true, None);
+    let after = main_view("en", &cfg, 0, Mode::Files, true, Some(0), None);
     let s = after.to_string();
     assert!(s.contains("Last report"));
     // In its own tab, like the report the scan opened.
@@ -666,4 +666,64 @@ fn the_screen_offers_the_last_report_once_there_is_one() {
         .find(|w| w["action"]["method"] == "report_tab")
         .expect("the way back to it");
     assert_eq!(button["open_in_tab"], true);
+}
+
+/// Two scans, two report tabs, and each tab answers about its own scan.
+///
+/// A row says "finding number two" — a position, which means nothing without the
+/// scan it counts into. Holding a single report made every open tab ask its
+/// questions of that one: filtering or opening a finding in the older tab
+/// answered out of the newer scan.
+#[test]
+fn an_older_report_still_answers_about_its_own_scan() {
+    let mut loki = Loki::default();
+    let first = loki.keep(parse(SAMPLE));
+    // A second scan, with a finding of its own that the first one never had.
+    let other = SAMPLE.replace("/tmp/evil.bin", "/tmp/other.bin");
+    let second = loki.keep(parse(&other));
+    assert_ne!(first, second, "each scan is its own report");
+
+    let shown = |id: u64| {
+        let r = loki.report(id).expect("still kept");
+        results_view("en", r, &wanted_levels(&Value::Null), 0, id).to_string()
+    };
+    assert!(shown(first).contains("/tmp/evil.bin"), "the older report's own findings");
+    assert!(!shown(first).contains("/tmp/other.bin"));
+    assert!(shown(second).contains("/tmp/other.bin"));
+
+    // Its rows say which report they are in, so a click in the older tab
+    // cannot be read as a click in the newer one.
+    let v = results_view(
+        "en",
+        loki.report(first).unwrap(),
+        &wanted_levels(&Value::Null),
+        0,
+        first,
+    );
+    let ids: Vec<String> = v["widgets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["kind"] == "table" && w.get("row_ids").is_some())
+        .and_then(|t| serde_json::from_value(t["row_ids"].clone()).ok())
+        .expect("the findings' ids");
+    assert!(ids.iter().all(|i| i.starts_with(&format!("{first}:"))), "{ids:?}");
+    let row = RowId::parse(&ids[0]).expect("one of ours");
+    assert_eq!(row.report, first);
+}
+
+/// Only the last few scans are kept — a report holds every finding of one — and
+/// a tab whose report has gone says so rather than answering out of another.
+#[test]
+fn the_oldest_report_is_dropped_rather_than_confused_with_a_newer_one() {
+    let mut loki = Loki::default();
+    let ids: Vec<u64> = (0..5).map(|_| loki.keep(parse(SAMPLE))).collect();
+    assert!(loki.report(ids[0]).is_none(), "the first one is gone");
+    for id in &ids[1..] {
+        assert!(loki.report(*id).is_some(), "report {id} is still here");
+    }
+    // And its id is never handed out again, so its rows resolve to nothing
+    // rather than into whatever took its place.
+    let next = loki.keep(parse(SAMPLE));
+    assert!(!ids.contains(&next));
 }

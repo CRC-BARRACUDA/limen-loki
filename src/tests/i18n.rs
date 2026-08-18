@@ -20,7 +20,7 @@ fn no_rendered_key_falls_through_to_itself() {
         for v in [
             install_view(lang, None),
             installing_view(lang, 1),
-            main_view(lang, &default_settings(), 1, Mode::Files, true, false, None),
+            main_view(lang, &default_settings(), 1, Mode::Files, true, None, None),
             settings_modal(lang, &default_settings(), Mode::Files),
             signatures_modal(
                 lang,
@@ -62,7 +62,7 @@ fn the_ukrainian_views_carry_no_english_prose() {
     for v in [
         install_view("uk", None),
         installing_view("uk", 1),
-        main_view("uk", &default_settings(), 1, Mode::Files, true, false, None),
+        main_view("uk", &default_settings(), 1, Mode::Files, true, None, None),
         settings_modal("uk", &default_settings(), Mode::Files),
         signatures_modal(
             "uk",

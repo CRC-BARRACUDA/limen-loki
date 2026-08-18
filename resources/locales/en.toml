@@ -112,6 +112,7 @@ nothing_at_levels = "Nothing at the selected levels."
 # The report has a tab of its own, and this is its name — "Loki" is the
 # module's tab, and two tabs of the same name are one tab too many.
 tab_title = "Scan report"
+gone = "This report is no longer kept — only the last few scans are. Run the scan again."
 page = "page {page} / {pages}"
 prev = "‹ Prev"
 next = "Next ›"
@@ -253,3 +254,4 @@ alerts = "{n} alert(s): something matched a rule."
 warnings = "{n} warning(s) worth a look."
 clean = "Nothing found."
 nothing_read = "Nothing was read, so this is not a clean result — see the report."
+gone = "That report is no longer loaded."

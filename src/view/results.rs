@@ -7,7 +7,13 @@ use crate::*;
 /// Basic answers the only question a basic scan asked — was anything found —
 /// and shows what. Advanced adds what the scanner actually did: how much it
 /// looked at, how long it took, and where the report is.
-pub(crate) fn results_view(lang: &str, r: &Report, levels: &[String], page: usize) -> Value {
+pub(crate) fn results_view(
+    lang: &str,
+    r: &Report,
+    levels: &[String],
+    page: usize,
+    id: u64,
+) -> Value {
     let t = |k: &str| catalog().tr(lang, k);
     let shown: Vec<&Event> = r
         .findings
@@ -173,7 +179,7 @@ pub(crate) fn results_view(lang: &str, r: &Report, levels: &[String], page: usiz
             "scan.ioc",
             "filter",
         )
-        .args(json!({ "levels": next.join(",") }));
+        .args(json!({ "levels": next.join(","), "report": id }));
         chips.push(if on { b.primary() } else { b });
     }
 
@@ -227,10 +233,13 @@ pub(crate) fn results_view(lang: &str, r: &Report, levels: &[String], page: usiz
         cols.push(t("cols.subject"));
         cols.push(t("cols.matched"));
 
+        // Which finding, in which report. A row id is the module's to choose
+        // and comes back untouched with every row action, so it is where a click
+        // stops meaning "number two of whatever was scanned last".
         let ids: Vec<String> = slice
             .iter()
             .enumerate()
-            .map(|(i, _)| (page * PAGE + i).to_string())
+            .map(|(i, _)| RowId::of(id, page * PAGE + i))
             .collect();
         // Opened here, in the report's own tab: a finding is a step further
         // into the report, and the detail screen's Back button is the way out
@@ -247,7 +256,7 @@ pub(crate) fn results_view(lang: &str, r: &Report, levels: &[String], page: usiz
         if page > 0 {
             pager.push(
                 button(t("results.prev"), "scan.ioc", "filter")
-                    .args(json!({ "levels": levels.join(","), "page": page - 1 })),
+                    .args(json!({ "levels": levels.join(","), "page": page - 1, "report": id })),
             );
         }
         pager.push(
@@ -261,7 +270,7 @@ pub(crate) fn results_view(lang: &str, r: &Report, levels: &[String], page: usiz
         if page + 1 < pages {
             pager.push(
                 button(t("results.next"), "scan.ioc", "filter")
-                    .args(json!({ "levels": levels.join(","), "page": page + 1 })),
+                    .args(json!({ "levels": levels.join(","), "page": page + 1, "report": id })),
             );
         }
         w.push(row(pager));
@@ -271,7 +280,7 @@ pub(crate) fn results_view(lang: &str, r: &Report, levels: &[String], page: usiz
 }
 
 /// One finding in full: what matched, where, and why.
-pub(crate) fn detail_view(lang: &str, e: &Event) -> Value {
+pub(crate) fn detail_view(lang: &str, e: &Event, report: u64) -> Value {
     let t = |k: &str| catalog().tr(lang, k);
     let mut w = vec![
         label(e.subject()).strong(),
@@ -373,6 +382,7 @@ pub(crate) fn detail_view(lang: &str, e: &Event) -> Value {
         label(serde_json::to_string_pretty(&e.raw).unwrap_or_else(|_| e.raw.to_string())).mono(),
     );
     w.push(separator());
-    w.push(button(t("detail.back"), "scan.ioc", "filter"));
+    // Back to the report this finding came out of, not to the newest one.
+    w.push(button(t("detail.back"), "scan.ioc", "filter").args(json!({ "report": report })));
     window(t("detail.matched"), w)
 }

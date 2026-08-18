@@ -2,10 +2,27 @@
 
 use crate::*;
 
+/// How many scans' reports are kept.
+///
+/// Each holds every finding of a scan, so they cannot all be kept for a session
+/// that runs all day. The oldest goes first, and a tab whose report has gone
+/// says so rather than answering out of somebody else's scan.
+const KEPT: usize = 4;
+
 #[derive(Default)]
 pub(crate) struct Loki {
-    /// The last scan's report, kept for the tab it is shown in.
-    pub(crate) report: Option<Report>,
+    /// The scans read this session, oldest first, each under the id its report's
+    /// rows and controls carry.
+    ///
+    /// Not just the newest one: a report is a tab that stays open, and a row in
+    /// it says "finding number two" — a position, which means nothing without
+    /// the scan it counts into. Holding a single report made every open tab ask
+    /// its questions of that one, so filtering or opening a finding in an older
+    /// tab answered out of the newer scan.
+    pub(crate) reports: Vec<(u64, Report)>,
+    /// The id the next scan gets. Never reused, so a row id from a report that
+    /// has been dropped resolves to nothing rather than to its replacement.
+    next_report: u64,
     /// Scan settings, loaded from `tools/settings.json` on first use and kept
     /// here so a scan does not have to re-read them off the disk.
     settings: Option<Value>,
@@ -62,7 +79,8 @@ impl Handler for Loki {
             // The entry point decides which screen you get: no scanner ->
             // install it, scanner present -> the scan screen.
             "ui" => {
-                self.report = None;
+                // The reports are not cleared: each is a tab that is still open,
+                // and coming back to this screen is not a reason to empty them.
                 Ok(if loki_bin(host).is_some() {
                     self.screen(host, lang, None)
                 } else {
@@ -89,7 +107,6 @@ impl Handler for Loki {
                         .and_then(Value::as_str)
                         .unwrap_or("files"),
                 );
-                self.report = None;
                 Ok(self.screen(host, lang, None))
             }
             "config" => {
@@ -474,20 +491,35 @@ impl Handler for Loki {
             // The last scan's report, in a tab of its own — opened by the scan
             // that produced it, and again from the screen when that tab is
             // gone.
-            "report_tab" => Ok(match &self.report {
-                Some(r) => results_view(lang, r, &wanted_levels(&Value::Null), 0),
-                None => self.screen(host, lang, None),
-            }),
+            // A report, in its own tab: opened by the scan that produced it, and
+            // again from the screen when that tab is gone. `report` says which —
+            // several can be open at once, and the newest is only the right
+            // answer when nobody named one.
+            "report_tab" => {
+                let which = params
+                    .get("report")
+                    .and_then(Value::as_u64)
+                    .or(self.newest_report());
+                Ok(match which.and_then(|id| self.report(id).map(|r| (id, r))) {
+                    Some((id, r)) => results_view(lang, r, &wanted_levels(&Value::Null), 0, id),
+                    None => self.gone(lang),
+                })
+            }
+            // Both of these are taken *in* a report, so both say which one.
             "filter" => {
-                let Some(r) = &self.report else {
-                    return Ok(self.screen(host, lang, None));
+                let Some((id, r)) = self.asked_for(&params) else {
+                    return Ok(self.gone(lang));
                 };
                 let page = params.get("page").and_then(Value::as_u64).unwrap_or(0) as usize;
-                Ok(results_view(lang, r, &wanted_levels(&params), page))
+                Ok(results_view(lang, r, &wanted_levels(&params), page, id))
             }
             "detail" => {
-                let Some(r) = &self.report else {
-                    return Ok(self.screen(host, lang, None));
+                let Some(row) = RowId::parse(params.get("id").and_then(Value::as_str).unwrap_or(""))
+                else {
+                    return Ok(self.gone(lang));
+                };
+                let Some(r) = self.report(row.report) else {
+                    return Ok(self.gone(lang));
                 };
                 let levels = wanted_levels(&params);
                 let shown: Vec<&Event> = r
@@ -495,14 +527,9 @@ impl Handler for Loki {
                     .iter()
                     .filter(|e| levels.iter().any(|l| l == &e.level))
                     .collect();
-                let idx = params
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(usize::MAX);
-                match shown.get(idx) {
-                    Some(e) => Ok(detail_view(lang, e)),
-                    None => Ok(results_view(lang, r, &levels, 0)),
+                match shown.get(row.index) {
+                    Some(e) => Ok(detail_view(lang, e, row.report)),
+                    None => Ok(results_view(lang, r, &levels, 0, row.report)),
                 }
             }
             "about" => Ok(json!({
@@ -553,8 +580,8 @@ impl Loki {
         let mode = self.mode;
         // Offered only when something in this session actually provides it.
         let has_autoruns = host.has_capability(AUTORUNS_CAP);
-        let has_report = self.report.is_some();
-        main_view(lang, self.cfg(host), custom, mode, has_autoruns, has_report, err)
+        let report = self.newest_report();
+        main_view(lang, self.cfg(host), custom, mode, has_autoruns, report, err)
     }
 
     /// Say a scan has begun — once per scan.
@@ -626,8 +653,53 @@ impl Loki {
     /// later does not open a second copy of the same report.
     pub(crate) fn present(&mut self, lang: &str, screen: Value, r: Report) -> Value {
         let screen = self.scan_notice(lang, &r, screen);
-        self.report = Some(r);
-        auto_in_tab(screen, "scan.ioc", "report_tab", json!({}))
+        let id = self.keep(r);
+        // Named, not implied: by the time this opens, the newest report is
+        // whatever finished last, which on a second scan is no longer this one.
+        auto_in_tab(screen, "scan.ioc", "report_tab", json!({ "report": id }))
+    }
+
+    /// Keep a finished report, and answer with the id its rows carry.
+    pub(crate) fn keep(&mut self, r: Report) -> u64 {
+        let id = self.next_report;
+        self.next_report += 1;
+        self.reports.push((id, r));
+        // The oldest goes first. Its tab may still be open; a click in it then
+        // finds nothing, which is the right answer — where answering out of a
+        // different scan was not.
+        while self.reports.len() > KEPT {
+            self.reports.remove(0);
+        }
+        id
+    }
+
+    /// The most recent scan's report, if there is one.
+    pub(crate) fn newest_report(&self) -> Option<u64> {
+        self.reports.last().map(|(id, _)| *id)
+    }
+
+    /// One report, by the id its rows carry.
+    pub(crate) fn report(&self, id: u64) -> Option<&Report> {
+        self.reports.iter().find(|(i, _)| *i == id).map(|(_, r)| r)
+    }
+
+    /// The report a call is about: the one it named, or the newest.
+    fn asked_for(&self, params: &Value) -> Option<(u64, &Report)> {
+        let id = params
+            .get("report")
+            .and_then(Value::as_u64)
+            .or(self.newest_report())?;
+        self.report(id).map(|r| (id, r))
+    }
+
+    /// What a click in a report opens when that report is no longer kept.
+    fn gone(&self, lang: &str) -> Value {
+        let t = |k: &str| catalog().tr(lang, k);
+        notice(
+            window(t("results.tab_title"), vec![label(t("results.gone")).weak()]),
+            "error",
+            t("notice.gone"),
+        )
     }
 
     /// Read a report the host ran on our behalf, with no `Job` behind it.

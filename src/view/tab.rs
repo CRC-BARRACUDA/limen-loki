@@ -15,9 +15,9 @@ pub(crate) fn main_view(
     custom: usize,
     mode: Mode,
     has_autoruns: bool,
-    // `has_report`: whether a scan has already run this session, so its report
-    // can be reopened after the tab it went to was closed.
-    has_report: bool,
+    // `report`: the last scan's report, if there is one, so it can be reopened
+    // after the tab it went to was closed.
+    report: Option<u64>,
     err: Option<&str>,
 ) -> Value {
     let t = |k: &str| catalog().tr(lang, k);
@@ -74,8 +74,12 @@ pub(crate) fn main_view(
     // The report of the last scan lives in a tab of its own. This is the way
     // back to it — a tab is a thing you can close, and the report should not go
     // with it.
-    if has_report {
-        actions.push(button(t("scan.last_report"), "scan.ioc", "report_tab").open_in_tab());
+    if let Some(id) = report {
+        actions.push(
+            button(t("scan.last_report"), "scan.ioc", "report_tab")
+                .args(json!({ "report": id }))
+                .open_in_tab(),
+        );
     }
     w.push(row(actions));
 

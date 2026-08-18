@@ -72,6 +72,33 @@ impl Event {
     }
 }
 
+/// Which finding, in which report: the `report:index` a row carries.
+///
+/// The module decides what a row id is and the host sends it back untouched, so
+/// this is where a click stops meaning "number two of whatever was scanned
+/// last". The index is into the *filtered* list the row was drawn from, which is
+/// why the levels ride along with it.
+pub(crate) struct RowId {
+    pub(crate) report: u64,
+    pub(crate) index: usize,
+}
+
+impl RowId {
+    /// The id row `index` of report `report` carries.
+    pub(crate) fn of(report: u64, index: usize) -> String {
+        format!("{report}:{index}")
+    }
+
+    /// Read one back, or `None` if it is not one of ours.
+    pub(crate) fn parse(s: &str) -> Option<RowId> {
+        let (report, index) = s.split_once(':')?;
+        Some(RowId {
+            report: report.parse().ok()?,
+            index: index.parse().ok()?,
+        })
+    }
+}
+
 pub(crate) fn str_of(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(str::to_string)
 }

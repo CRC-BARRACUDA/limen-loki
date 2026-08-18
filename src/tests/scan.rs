@@ -146,7 +146,7 @@ fn the_scanner_output_can_be_shown_and_is_bounded() {
 fn a_scan_that_could_not_be_stopped_says_it_is_still_running() {
     let mut r = parse(SAMPLE);
     r.still_running = true;
-    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &r, &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(v.contains("could not be stopped from here"));
     assert!(v.contains("still going"));
     // ...and what is shown is flagged as partial.
@@ -154,7 +154,7 @@ fn a_scan_that_could_not_be_stopped_says_it_is_still_running() {
 
     // A scan that ended normally carries none of that.
     let done = parse(SAMPLE);
-    let v = results_view("en", &done, &wanted_levels(&Value::Null), 0).to_string();
+    let v = results_view("en", &done, &wanted_levels(&Value::Null), 0, 0).to_string();
     assert!(!v.contains("could not be stopped"));
 }
 
@@ -371,8 +371,8 @@ fn each_scan_offers_only_its_own_settings() {
     }
 
     // And the tab asks for a path only when there is one to ask for.
-    let ftab = main_view("en", &cfg, 0, Mode::Files, true, false, None).to_string();
-    let ptab = main_view("en", &cfg, 0, Mode::Procs, true, false, None).to_string();
+    let ftab = main_view("en", &cfg, 0, Mode::Files, true, None, None).to_string();
+    let ptab = main_view("en", &cfg, 0, Mode::Procs, true, None, None).to_string();
     assert!(ftab.contains("Scan target"));
     assert!(
         !ptab.contains("Scan target"),
@@ -382,12 +382,12 @@ fn each_scan_offers_only_its_own_settings() {
     // One button cycles the three, so none is a dead end.
     assert!(ftab.contains("Scan running processes instead"));
     assert!(ptab.contains("Scan what starts automatically instead"));
-    let atab = main_view("en", &cfg, 0, Mode::Autoruns, true, false, None).to_string();
+    let atab = main_view("en", &cfg, 0, Mode::Autoruns, true, None, None).to_string();
     assert!(atab.contains("Scan files or a folder instead"));
 
     // ...and autostart is skipped entirely when nothing provides it, rather
     // than offering a scan that cannot run.
-    let no_ar = main_view("en", &cfg, 0, Mode::Procs, false, false, None).to_string();
+    let no_ar = main_view("en", &cfg, 0, Mode::Procs, false, None, None).to_string();
     assert!(no_ar.contains("Scan files or a folder instead"));
     assert!(!no_ar.contains("starts automatically instead"));
 }
